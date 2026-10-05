@@ -1,0 +1,11 @@
+# Build output (CMake, the AppImage builder and its container build)
+build/
+build-appimage/
+build-appimage-container/
+dist/
+
+# Reference screenshots: other people's artwork, kept locally only
+UI Reference*/
+
+# Local copy of the explainer page
+VeeaStats Internals.html

@@ -1,0 +1,160 @@
+#!/bin/sh
+# Entry point of the AppImage. Opening the AppImage installs it for the current
+# user (no root needed), then starts VeeaStats:
+#   - copies the AppImage to ~/.local/share/veeastats/
+#   - adds a menu entry + icon, so desktops show the right icon in the taskbar
+#   - opening a different (newer) AppImage later replaces the installed copy
+#   - on desktop PCs, offers once to turn on the motherboard sensor driver (VCore)
+# Uninstall from the menu entry's right-click "Uninstall VeeaStats" action, or
+# run the AppImage with --uninstall.
+
+HERE="$(dirname "$(readlink -f "$0")")"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+INSTALL_DIR="$DATA_HOME/veeastats"
+TARGET="$INSTALL_DIR/VeeaStats.AppImage"
+ICON="$INSTALL_DIR/veeastats.svg"
+DESKTOP_FILE="$DATA_HOME/applications/veeastats.desktop"
+SENSOR_MARKER="$INSTALL_DIR/sensor-setup"                   # remembers the answer, so we ask once
+SENSOR_CONF="/etc/modules-load.d/veeastats-sensors.conf"   # loads the driver at every boot
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send --app-name=VeeaStats --icon="$ICON" "VeeaStats" "$1" 2>/dev/null
+}
+
+# Asks yes/no with whatever dialog tool the desktop has. If no dialog can be
+# shown (none installed, or no display), the user asked explicitly, so proceed.
+confirm() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --question --title="VeeaStats" --text="$1" 2>/dev/null
+        case $? in 0) return 0 ;; 1) return 1 ;; esac
+    fi
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "VeeaStats" --yesno "$1" 2>/dev/null
+        case $? in 0) return 0 ;; 1|2) return 1 ;; esac
+    fi
+    return 0
+}
+
+write_menu_entry() {
+    mkdir -p "$(dirname "$DESKTOP_FILE")"
+    cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=VeeaStats
+GenericName=Hardware Monitor
+Comment=Monitor CPU, memory, GPU and drive usage
+Exec="$TARGET"
+Icon=$ICON
+Terminal=false
+Categories=System;Monitor;
+Keywords=cpu;gpu;ram;hardware;monitor;temperature;
+StartupWMClass=veeastats
+Actions=Uninstall;
+
+[Desktop Action Uninstall]
+Name=Uninstall VeeaStats
+Exec="$TARGET" --uninstall
+EOF
+    command -v update-desktop-database >/dev/null 2>&1 &&
+        update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null
+}
+
+# --- CPU voltage driver ------------------------------------------------------
+# Desktop motherboards report VCore through a "Super I/O" sensor chip, whose
+# kernel driver Linux doesn't load on its own (Ryzen 7000+ CPUs report no
+# voltage themselves). With the user's permission, load the right driver once
+# as root and make it load at every boot.
+
+has_voltage_source() {
+    for dir in /sys/class/hwmon/hwmon*; do
+        case "$(cat "$dir/name" 2>/dev/null)" in
+            nct6*|it8*|w836*|zenpower|asusec) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+is_laptop() {
+    # SMBIOS chassis types: portable, laptop, notebook, handheld, sub-notebook,
+    # tablet, convertible, detachable. Laptops have no Super I/O sensor chip.
+    case "$(cat /sys/class/dmi/id/chassis_type 2>/dev/null)" in
+        8|9|10|11|14|30|31|32) return 0 ;;
+    esac
+    return 1
+}
+
+# Runs as root. Loads whichever driver finds a chip (nct6775 = Nuvoton, used by
+# ASUS/MSI/ASRock; it87 = ITE, used by Gigabyte). modprobe fails when the
+# driver finds no chip, so a success means it is working.
+ROOT_ENABLE_SENSORS='
+for module in nct6775 it87; do
+    if modprobe "$module" 2>/dev/null; then
+        mkdir -p /etc/modules-load.d
+        echo "$module" > '"$SENSOR_CONF"'
+        exit 0
+    fi
+done
+exit 2'
+
+setup_sensor_driver() {
+    [ -f "$SENSOR_MARKER" ] && return
+    mkdir -p "$INSTALL_DIR"
+    if has_voltage_source || is_laptop || [ "$(uname -m)" != "x86_64" ]; then
+        return   # checked again next launch, in case the driver was only loaded by hand
+    fi
+    command -v pkexec >/dev/null 2>&1 || return
+
+    if ! confirm "VeeaStats can show your CPU voltage (VCore) by turning on your motherboard's sensor driver.
+
+This needs your password once. Turn it on?"; then
+        echo "declined" > "$SENSOR_MARKER"; return
+    fi
+    pkexec sh -c "$ROOT_ENABLE_SENSORS"
+    case $? in
+        0) echo "enabled" > "$SENSOR_MARKER"; notify "CPU voltage readings are now turned on." ;;
+        2) echo "no-chip" > "$SENSOR_MARKER"; notify "No supported sensor chip was found, so CPU voltage will show as N/A." ;;
+        *) echo "declined" > "$SENSOR_MARKER" ;;   # password prompt cancelled
+    esac
+}
+
+if [ "$1" = "--uninstall" ]; then
+    confirm "Remove VeeaStats from this computer?" || exit 0
+    "$HERE/usr/bin/CpuMonitor" --quit   # close it if it's running in the background
+    # Ask for the password only if the installer turned the driver on.
+    [ -f "$SENSOR_CONF" ] && command -v pkexec >/dev/null 2>&1 && pkexec rm -f "$SENSOR_CONF"
+    rm -f "$DESKTOP_FILE" "$TARGET" "$ICON" "$SENSOR_MARKER"
+    rmdir "$INSTALL_DIR" 2>/dev/null
+    command -v update-desktop-database >/dev/null 2>&1 &&
+        update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send --app-name=VeeaStats "VeeaStats" "VeeaStats has been uninstalled." 2>/dev/null
+    exit 0
+fi
+
+# $APPIMAGE is set by the AppImage runtime; it's missing when run from an
+# extracted folder, in which case there is nothing to install.
+if [ -n "$APPIMAGE" ] && [ "$(readlink -f "$APPIMAGE")" != "$(readlink -f "$TARGET")" ]; then
+    if [ ! -f "$TARGET" ]; then message="Installed. You can now open VeeaStats from your app menu."
+    elif ! cmp -s "$APPIMAGE" "$TARGET"; then message="Updated to the version you just opened."
+    else message=""
+    fi
+    if [ -n "$message" ]; then
+        mkdir -p "$INSTALL_DIR"
+        # Copy to a temp name first so a running copy is never left half-written.
+        cp "$APPIMAGE" "$TARGET.new" && chmod +x "$TARGET.new" && mv -f "$TARGET.new" "$TARGET"
+        cp "$HERE/veeastats.svg" "$ICON"
+        write_menu_entry
+        notify "$message"
+    fi
+fi
+
+# Running the installed copy: restore the menu entry if someone deleted it.
+if [ -n "$APPIMAGE" ] && [ -f "$TARGET" ] && [ ! -f "$DESKTOP_FILE" ]; then
+    [ -f "$ICON" ] || cp "$HERE/veeastats.svg" "$ICON"
+    write_menu_entry
+fi
+
+[ -n "$APPIMAGE" ] && setup_sensor_driver
+
+exec "$HERE/usr/bin/CpuMonitor" "$@"

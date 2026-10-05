@@ -6,7 +6,8 @@
 #   - opening a different (newer) AppImage later replaces the installed copy
 #   - on desktop PCs, offers once to turn on the motherboard sensor driver (VCore)
 # Uninstall from the menu entry's right-click "Uninstall VeeaStats" action, or
-# run the AppImage with --uninstall.
+# run the AppImage with --uninstall. --install installs without starting it
+# (install.sh, in the repository, uses that).
 
 HERE="$(dirname "$(readlink -f "$0")")"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -126,7 +127,7 @@ This needs your password once. Turn it on?" 2
 
 if [ "$1" = "--uninstall" ]; then
     confirm "Remove VeeaStats from this computer?" 0 || exit 0   # the user asked for this, so no dialog means yes
-    "$HERE/usr/bin/CpuMonitor" --quit   # close it if it's running in the background
+    "$HERE/usr/bin/CpuMonitor" --quit 2>/dev/null   # close it if it's running in the background
     # Ask for the password only if the installer turned the driver on.
     [ -f "$SENSOR_CONF" ] && command -v pkexec >/dev/null 2>&1 && pkexec rm -f "$SENSOR_CONF"
     rm -f "$DESKTOP_FILE" "$TARGET" "$ICON" "$SENSOR_MARKER"
@@ -162,5 +163,16 @@ if [ -n "$APPIMAGE" ] && [ -f "$TARGET" ] && [ ! -f "$DESKTOP_FILE" ]; then
 fi
 
 [ -n "$APPIMAGE" ] && setup_sensor_driver
+
+# --install (used by install.sh): install or update, then stop without starting VeeaStats.
+if [ "$1" = "--install" ]; then
+    if [ -f "$TARGET" ]; then
+        echo "VeeaStats is installed. Open it from your app menu, or run: $TARGET"
+    else
+        echo "Nothing installed: run this from the AppImage itself." >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 exec "$HERE/usr/bin/CpuMonitor" "$@"

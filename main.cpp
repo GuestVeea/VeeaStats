@@ -1475,6 +1475,1078 @@ private:
     LiveStats stats_;
 };
 
+// ============================================================================
+// 5. UI
+// ============================================================================
+
+// ---- Settings --------------------------------------------------------------
+
+enum class Skin { Classic, Jarv, Galactic, Gunship, Halloween };
+
+// Every skin, in the order the Skin dropdown lists them. `id` is how
+// settings.conf stores it; `name` is what the dropdown shows.
+struct SkinChoice {
+    Skin skin;
+    const char* id;
+    const char* name;
+};
+constexpr SkinChoice kSkinChoices[] = {
+    {Skin::Classic,  "classic",  "Classic"},
+    {Skin::Jarv,     "jarv",     "JARV"},
+    {Skin::Galactic, "galactic", "Galactic Conflict"},
+    {Skin::Gunship,  "gunship",  "Federation Gunship"},
+    {Skin::Halloween, "halloween", "Halloween"},
+};
+
+const SkinChoice& skinChoice(Skin skin) {
+    for (const SkinChoice& choice : kSkinChoices) {
+        if (choice.skin == skin) return choice;
+    }
+    return kSkinChoices[0];
+}
+
+// What the settings menu controls. Saved to ~/.config/veeastats/settings.conf
+// whenever it changes, so the choice survives a restart.
+struct Settings {
+    Skin skin{Skin::Classic};
+    bool animations{true};   // every skin but Classic: turning rings, blinking lights, gliding numbers
+    int refreshMs{kDefaultRefreshMs};
+    bool runInBackground{false};   // closing the window hides it, so the overlay hotkey keeps working
+    bool limitOverlayToApp{true};  // the overlay opens only on a focused app, and lives and dies with it
+};
+
+bool operator!=(const Settings& a, const Settings& b) {
+    return a.skin != b.skin || a.animations != b.animations || a.refreshMs != b.refreshMs ||
+           a.runInBackground != b.runInBackground || a.limitOverlayToApp != b.limitOverlayToApp;
+}
+
+std::string settingsFilePath() {
+    const char* configHome = getenv("XDG_CONFIG_HOME");
+    const char* home = getenv("HOME");
+    if (configHome && *configHome) return std::string(configHome) + "/veeastats/settings.conf";
+    if (home && *home)             return std::string(home) + "/.config/veeastats/settings.conf";
+    return "";
+}
+
+// A missing or unreadable file simply gives the defaults, and so does an
+// interval that isn't one of the menu's choices.
+Settings loadSettings() {
+    Settings settings;
+    forEachLine(settingsFilePath(), [&](const char* line) {
+        const std::string text = trim(line);
+        if (startsWith(text, "skin=")) {
+            for (const SkinChoice& choice : kSkinChoices) {
+                if (text.substr(strlen("skin=")) == choice.id) settings.skin = choice.skin;
+            }
+        }
+        else if (text == "animations=0") settings.animations = false;
+        else if (text == "background=1") settings.runInBackground = true;
+        else if (text == "limit_overlay=0") settings.limitOverlayToApp = false;
+        else if (startsWith(text, "refresh_ms=")) {
+            const int ms = atoi(text.c_str() + strlen("refresh_ms="));
+            if (std::find(std::begin(kRefreshChoicesMs), std::end(kRefreshChoicesMs), ms) != std::end(kRefreshChoicesMs)) {
+                settings.refreshMs = ms;
+            }
+        }
+        return kKeepGoing;
+    });
+    return settings;
+}
+
+void saveSettings(const Settings& settings) {
+    const std::string path = settingsFilePath();
+    if (path.empty()) return;
+    std::error_code error;
+    fs::create_directories(fs::path(path).parent_path(), error);
+    FILE* file = fopen(path.c_str(), "w");
+    if (!file) return;
+    fprintf(file, "skin=%s\nanimations=%d\nrefresh_ms=%d\nbackground=%d\nlimit_overlay=%d\n",
+            skinChoice(settings.skin).id, settings.animations ? 1 : 0, settings.refreshMs,
+            settings.runInBackground ? 1 : 0, settings.limitOverlayToApp ? 1 : 0);
+    fclose(file);
+}
+
+// Everything the user can change from the window. main() reacts to changes after each frame.
+struct UiState {
+    bool settingsOpen{false};   // the gear's menu is showing
+    bool quitRequested{false};  // "Quit VeeaStats" in the gear menu (only offered in background mode)
+    Settings settings;
+};
+
+// ---- Shared widgets ----------------------------------------------------------
+
+// Colours
+const ImVec4 kGreen (0.20f, 0.75f, 0.35f, 1.0f);   // usage bars: normal / busy / critical
+const ImVec4 kOrange(0.95f, 0.65f, 0.15f, 1.0f);
+const ImVec4 kRed   (0.90f, 0.25f, 0.25f, 1.0f);
+
+const ImVec4 kTitleColor  (0.90f, 0.90f, 0.90f, 1.0f);
+const ImVec4 kCpuHeading  (0.40f, 0.80f, 1.00f, 1.0f);
+const ImVec4 kRamHeading  (1.00f, 0.80f, 0.40f, 1.0f);
+const ImVec4 kGpuHeading  (0.90f, 0.40f, 0.90f, 1.0f);
+const ImVec4 kInfoHeading (0.20f, 0.85f, 0.60f, 1.0f);
+const ImVec4 kClockColor  (0.20f, 0.85f, 0.40f, 1.0f);
+const ImVec4 kVoltageColor(0.30f, 0.90f, 0.90f, 1.0f);
+const ImVec4 kErrorColor  (0.90f, 0.30f, 0.30f, 1.0f);
+
+// Green, then orange above warnAt and red above critAt (fractions, 0..1).
+const ImVec4& usageColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kRed : (fraction > warnAt) ? kOrange : kGreen;
+}
+
+// "label [=====----] text" - the bar turns orange above warnAt and red above critAt (0..1).
+void drawUsageBar(const char* label, float percent, const std::string& text, float warnAt, float critAt) {
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, usageColor(percent, warnAt, critAt));
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::ProgressBar(percent / 100.0f, ImVec2(0.0f, 0.0f), text.c_str());
+    ImGui::PopStyleColor();
+}
+
+// "3.20 GHz | 1.100 V", or greyed-out "N/A" placeholders when a sensor is missing.
+void drawClockAndVoltage(double clockGhz, double volts, const char* voltageName) {
+    if (clockGhz > 0.0) ImGui::TextColored(kClockColor, "%.2f GHz", clockGhz);
+    else                ImGui::TextDisabled("Clock: N/A");
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+
+    if (volts > 0.0) ImGui::TextColored(kVoltageColor, "%.3f V", volts);
+    else             ImGui::TextDisabled("%s: N/A", voltageName);
+}
+
+// A two-column "Property | Value" table. Returns false if it can't be shown;
+// otherwise the caller adds rows with drawInfoRow() and then calls ImGui::EndTable().
+bool beginInfoTable(const char* id, float labelWidth) {
+    if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_PadOuterX)) return false;
+    ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthFixed, labelWidth);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+    return true;
+}
+
+void drawInfoRow(const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("%s", label);
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+void drawCpuSection(const StaticInfo& info, const LiveStats& live) {
+    ImGui::TextColored(kCpuHeading, "Per-Core CPU Load");
+    ImGui::TextWrapped("%s", info.cpuModel.c_str());
+    drawClockAndVoltage(live.cpuFreqGhz, live.cpuVoltage, "VCore");
+    ImGui::Spacing();
+
+    ImGui::BeginChild("CpuCoresRegion", ImVec2(0, 200), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (size_t i = 0; i < live.cpuPercent.size(); ++i) {
+        drawUsageBar(format("CPU %2zu", i).c_str(), live.cpuPercent[i], format("%.1f%%", live.cpuPercent[i]), 0.50f, 0.80f);
+    }
+    ImGui::EndChild();
+}
+
+void drawRamSection(const StaticInfo& info, const LiveStats& live) {
+    ImGui::TextColored(kRamHeading, "System Memory");
+    ImGui::Spacing();
+
+    const RamStats& ram = live.ram;
+    drawUsageBar("RAM ", ram.percent, format("%.2f / %.2f GB (%.1f%%)", ram.usedGb, ram.totalGb, ram.percent), 0.65f, 0.85f);
+
+    if (info.ramModules.empty()) {
+        ImGui::TextDisabled("Module Models: Standard System RAM");
+        return;
+    }
+    ImGui::Spacing();
+    ImGui::TextDisabled("Detected Memory Modules:");
+    for (const std::string& module : info.ramModules) {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", module.c_str());
+    }
+}
+
+const char* vendorName(GpuVendor vendor) {
+    switch (vendor) {
+        case GpuVendor::Nvidia:  return "NVIDIA";
+        case GpuVendor::Amd:     return "AMD Radeon";
+        case GpuVendor::Intel:   return "Intel";
+        case GpuVendor::Mali:    return "ARM Mali";
+        case GpuVendor::Unknown: break;
+    }
+    return "Unknown";
+}
+
+// " (AMD Radeon)" for the GPU heading, or "" if the vendor is unknown.
+std::string vendorTag(GpuVendor vendor) {
+    return vendor == GpuVendor::Unknown ? "" : format(" (%s)", vendorName(vendor));
+}
+
+void drawGpuSection(const LiveStats& live) {
+    const GpuStats& gpu = live.gpu;
+
+    ImGui::TextColored(kGpuHeading, "GPU Metrics%s", vendorTag(gpu.vendor).c_str());
+    ImGui::TextWrapped("Card: %s", gpu.name.c_str());
+    drawClockAndVoltage(gpu.clockGhz, gpu.voltageV, "VDDC");
+    ImGui::Spacing();
+
+    if (!gpu.hasLoad && !gpu.hasMemory && gpu.loadNote.empty()) {
+        ImGui::TextColored(kErrorColor, "GPU stats unavailable");
+        return;
+    }
+
+    // Core load: a bar if the driver gives us a number, otherwise a short explanation.
+    if (gpu.hasLoad) {
+        drawUsageBar("Core", gpu.gpuUsage, format("%.1f%%%s", gpu.gpuUsage, gpu.loadIsEstimate ? " (est.)" : ""), 0.50f, 0.85f);
+    } else if (!gpu.loadNote.empty()) {
+        ImGui::TextDisabled("%s", gpu.loadNote.c_str());
+    }
+
+    // Video memory: a bar for cards with their own memory, otherwise a note
+    // (integrated GPUs and Mali use ordinary system RAM).
+    if (gpu.hasMemory) {
+        drawUsageBar("VRAM", gpu.vramUsage,
+                     format("%.2f / %.2f GB (%.1f%%)", gpu.vramUsedGb, gpu.vramTotalGb, gpu.vramUsage), 0.65f, 0.85f);
+    } else if (!gpu.memoryNote.empty()) {
+        ImGui::TextDisabled("%s", gpu.memoryNote.c_str());
+    }
+}
+
+void drawHardwareInfo(const StaticInfo& info, const LiveStats& live) {
+    ImGui::TextColored(kInfoHeading, "Hardware Information");
+    ImGui::Spacing();
+    if (!beginInfoTable("HardwareInfoTable", 110.0f)) return;
+
+    drawInfoRow("CPU Model", info.cpuModel);
+    drawInfoRow("GPU Model", live.gpu.name);
+    drawInfoRow("RAM Size", format("%.2f GB", live.ram.totalGb));
+    drawInfoRow("Motherboard", info.board.name);
+    drawInfoRow("Chipset", info.board.chipset);
+    for (size_t i = 0; i < info.drives.size(); ++i) {
+        const DriveInfo& drive = info.drives[i];
+        drawInfoRow(i == 0 ? "Storage Drives" : "",
+                    format("[%s] %s - %.1f GB (%s)", drive.deviceName.c_str(), drive.model.c_str(), drive.sizeGb, drive.type.c_str()));
+    }
+    ImGui::EndTable();
+}
+
+void drawOsInfo(const StaticInfo& info, const LiveStats& live) {
+    ImGui::TextColored(kInfoHeading, "Operating System Information");
+    ImGui::Spacing();
+    if (!beginInfoTable("OsInfoTable", 100.0f)) return;
+
+    drawInfoRow("OS", info.os.osName);
+    drawInfoRow("Kernel", info.os.kernel);
+    drawInfoRow("Uptime", live.uptime);
+    drawInfoRow("Packages", info.os.packages);
+    drawInfoRow("Shell", info.os.shell);
+    ImGui::EndTable();
+}
+
+// A gear-shaped button. The default font has no icon characters, so the gear is
+// drawn from shapes: a thick ring for the body plus rectangles for the teeth.
+// Returns true when clicked. `active` keeps it highlighted while its menu is open.
+bool drawGearButton(const char* id, float size, bool active) {
+    constexpr int kTeeth = 8;
+
+    const ImVec2 topLeft = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::SetItemTooltip("Settings");
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (hovered || active) {
+        draw->AddRectFilled(topLeft, ImVec2(topLeft.x + size, topLeft.y + size),
+                            ImGui::GetColorU32(ImGuiCol_FrameBgHovered), ImGui::GetStyle().FrameRounding);
+    }
+
+    const ImU32 color = ImGui::GetColorU32((hovered || active) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+    const ImVec2 center(topLeft.x + size * 0.5f, topLeft.y + size * 0.5f);
+    const float tipRadius  = size * 0.42f;
+    const float bodyRadius = tipRadius * 0.72f;
+    const float holeRadius = tipRadius * 0.32f;
+    const float toothHalfWidth = tipRadius * 0.18f;
+
+    // Body: drawn as a thick outline, so the hole in the middle stays see-through.
+    draw->AddCircle(center, (bodyRadius + holeRadius) * 0.5f, color, 0, bodyRadius - holeRadius);
+
+    for (int i = 0; i < kTeeth; ++i) {
+        const float angle = 2.0f * kPi * static_cast<float>(i) / kTeeth;
+        const ImVec2 out(cosf(angle), sinf(angle));                     // centre -> tooth
+        const ImVec2 side(-out.y * toothHalfWidth, out.x * toothHalfWidth);
+        const float baseRadius = bodyRadius - 1.0f;                     // overlap the ring: no gap
+        const ImVec2 base(center.x + out.x * baseRadius, center.y + out.y * baseRadius);
+        const ImVec2 tip (center.x + out.x * tipRadius,  center.y + out.y * tipRadius);
+        draw->AddQuadFilled(ImVec2(base.x - side.x, base.y - side.y), ImVec2(tip.x - side.x, tip.y - side.y),
+                            ImVec2(tip.x + side.x, tip.y + side.y),   ImVec2(base.x + side.x, base.y + side.y), color);
+    }
+    return clicked;
+}
+
+// "[ 500 ms v ]" - a dropdown that changes `refreshMs` when the user picks a value.
+void drawIntervalPicker(int& refreshMs) {
+    ImGui::SetNextItemWidth(-FLT_MIN);   // as wide as the menu
+    if (ImGui::BeginCombo("##UpdateInterval", format("%d ms", refreshMs).c_str())) {
+        for (const int choice : kRefreshChoicesMs) {
+            const bool isCurrent = (choice == refreshMs);
+            if (ImGui::Selectable(format("%d ms", choice).c_str(), isCurrent)) refreshMs = choice;
+            if (isCurrent) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+}
+
+// "[ JARV v ]" - a dropdown that changes `skin` when the user picks one.
+void drawSkinPicker(Skin& skin) {
+    ImGui::SetNextItemWidth(-FLT_MIN);   // as wide as the menu
+    if (ImGui::BeginCombo("##Skin", skinChoice(skin).name)) {
+        for (const SkinChoice& choice : kSkinChoices) {
+            const bool isCurrent = (choice.skin == skin);
+            if (ImGui::Selectable(choice.name, isCurrent)) skin = choice.skin;
+            if (isCurrent) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+}
+
+// The small menu that drops down from the gear (gearMin/gearMax = the gear's
+// rectangle). Closes when the user clicks anywhere else or presses Escape; a
+// click on the gear itself is left to the gear, which toggles the menu.
+void drawSettingsMenu(UiState& ui, const ImVec2& gearMin, const ImVec2& gearMax) {
+    ImGui::SetNextWindowPos(ImVec2(gearMax.x, gearMax.y + 6.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(150.0f, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+
+    ImGui::TextDisabled("Skin");
+    drawSkinPicker(ui.settings.skin);
+    ImGui::BeginDisabled(ui.settings.skin == Skin::Classic);   // Classic has nothing to animate
+    ImGui::Checkbox("Animations", &ui.settings.animations);
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Update Interval");
+    drawIntervalPicker(ui.settings.refreshMs);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Overlay (Ctrl+Shift+O)");
+    ImGui::Checkbox("Limit Overlay to Focused App", &ui.settings.limitOverlayToApp);
+    ImGui::SetItemTooltip("Ties Overlay to Focused App. Unchecking leaves overlay open, ignoring focused app");
+    ImGui::Checkbox("Keep VeeaStats running in the background", &ui.settings.runInBackground);
+    ImGui::SetItemTooltip("Will allow overlay hotkey to remain active even when VeeaStats is closed");
+    if (ui.settings.runInBackground) {
+        ImGui::Separator();
+        if (ImGui::Selectable("Quit VeeaStats")) ui.quitRequested = true;
+    }
+
+    const bool clickedElsewhere = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                                  !ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
+                                                          ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                                  !ImGui::IsMouseHoveringRect(gearMin, gearMax, false);   // false: the gear is outside this menu's clip area
+    if (clickedElsewhere || ImGui::IsKeyPressed(ImGuiKey_Escape)) ui.settingsOpen = false;
+    ImGui::End();
+}
+
+// The whole window in the Classic skin: performance on top, system details below.
+// `ui` is read and (if the user changes something) updated here.
+void drawDashboard(const ImVec2& windowSize, UiState& ui, const StaticInfo& info, const LiveStats& live) {
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(windowSize);
+    ImGui::Begin("VeeaStats", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    // Title on the left, settings gear pinned to the right edge of the same row.
+    const float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    const float gearSize = ImGui::GetFrameHeight();
+    ImGui::AlignTextToFramePadding();   // centres the title on the gear's height
+    ImGui::TextColored(kTitleColor, "System Performance Dashboard");
+    ImGui::SameLine(rightEdge - gearSize);
+    if (drawGearButton("##Settings", gearSize, ui.settingsOpen)) ui.settingsOpen = !ui.settingsOpen;
+    const ImVec2 gearMin = ImGui::GetItemRectMin(), gearMax = ImGui::GetItemRectMax();
+
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    const ImGuiTableFlags columnFlags = ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_Resizable;
+
+    if (ImGui::BeginTable("PerformanceTable", 2, columnFlags)) {
+        ImGui::TableNextColumn();   // left: CPU + RAM
+        drawCpuSection(info, live);
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        drawRamSection(info, live);
+
+        ImGui::TableNextColumn();   // right: GPU
+        drawGpuSection(live);
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::BeginTable("SystemInfoColumnsTable", 2, columnFlags)) {
+        ImGui::TableNextColumn();
+        drawHardwareInfo(info, live);
+        ImGui::TableNextColumn();
+        drawOsInfo(info, live);
+        ImGui::EndTable();
+    }
+
+    ImGui::End();
+
+    if (ui.settingsOpen) drawSettingsMenu(ui, gearMin, gearMax);
+}
+
+// ============================================================================
+// 6. HUD SKINS (JARV, GALACTIC CONFLICT, FEDERATION GUNSHIP, HALLOWEEN)
+// ============================================================================
+// These skins share one layout: a header, four gauges, then two rows of panels
+// (CPU cores + graphics, hardware + operating system). Each skin supplies the
+// drawing for those parts through a HudSkin; the layout itself is
+// drawHudDashboard() at the end of this section. A new skin of this kind only
+// needs its own drawing functions and an entry in makeHudSkins() (section 7).
+//
+// Everything is drawn with ImGui's shape functions, so no skin needs images or
+// extra libraries.
+
+// ---- Shared by every HUD skin -----------------------------------------------
+
+// A rectangle on screen.
+struct Box {
+    ImVec2 min, max;
+    float width() const { return max.x - min.x; }
+    float height() const { return max.y - min.y; }
+};
+
+ImU32 withAlpha(const ImVec4& color, float alpha) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, color.w * alpha));
+}
+
+ImVec2 pointOnCircle(const ImVec2& center, float radius, float angle) {
+    return ImVec2(center.x + cosf(angle) * radius, center.y + sinf(angle) * radius);
+}
+
+std::string upperCase(std::string text) {
+    for (char& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return text;
+}
+
+// "VRAM: shares system RAM" -> "SHARES SYSTEM RAM".
+std::string noteValue(const std::string& note) {
+    const size_t colon = note.find(": ");
+    return upperCase(colon == std::string::npos ? note : note.substr(colon + 2));
+}
+
+ImVec2 textSize(ImFont* font, float size, const std::string& text) {
+    return font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+}
+
+// Text centred on `center`, both across and up/down.
+void drawCenteredText(ImDrawList* draw, ImFont* font, float size, const ImVec2& center, ImU32 color, const std::string& text) {
+    const ImVec2 extent = textSize(font, size, text);
+    draw->AddText(font, size, ImVec2(center.x - extent.x * 0.5f, center.y - extent.y * 0.5f), color, text.c_str());
+}
+
+// The skin's fonts plus the few things it remembers between frames.
+struct HudState {
+    ImFont* textFont{nullptr};      // labels and values
+    ImFont* displayFont{nullptr};   // headings and big numbers
+    bool animate{true};
+    float time{0.0f};               // seconds; drives the moving parts (stays 0 when not animating)
+    // The numbers as currently drawn. While animating they glide towards the
+    // live values instead of jumping.
+    float cpu{0.0f}, ram{0.0f}, gpu{0.0f}, vram{0.0f};
+    std::vector<float> cores;
+};
+
+// While animating, displayed numbers move a share of the remaining distance
+// each frame, so a change takes about half a second to settle.
+void glide(float& shown, float target, bool animate) {
+    if (!animate) {
+        shown = target;
+        return;
+    }
+    shown += (target - shown) * (1.0f - expf(-ImGui::GetIO().DeltaTime * 8.0f));
+}
+
+void glideHudValues(HudState& state, const LiveStats& live) {
+    glide(state.cpu, averageCpuPercent(live), state.animate);
+    glide(state.ram, live.ram.percent, state.animate);
+    glide(state.gpu, live.gpu.hasLoad ? live.gpu.gpuUsage : 0.0f, state.animate);
+    glide(state.vram, live.gpu.hasMemory ? live.gpu.vramUsage : 0.0f, state.animate);
+    state.cores.resize(live.cpuPercent.size(), 0.0f);
+    for (size_t i = 0; i < live.cpuPercent.size(); ++i) glide(state.cores[i], live.cpuPercent[i], state.animate);
+}
+
+// What each of the four gauges shows.
+struct GaugeReading {
+    std::string label;          // e.g. "CPU"
+    float percent;              // as drawn (smoothed)
+    bool hasValue;
+    float warnAt, critAt;       // 0..1: where it turns to the "busy" / "critical" colour
+    std::string line1, line2;   // readouts under the gauge
+};
+
+std::array<GaugeReading, 4> gaugeReadings(const HudState& state, const LiveStats& live) {
+    const GpuStats& gpu = live.gpu;
+    const bool gpuReports = gpu.hasLoad || gpu.hasMemory || !gpu.loadNote.empty();
+    return {{
+        {"CPU", state.cpu, !live.cpuPercent.empty(), 0.50f, 0.80f,
+         live.cpuFreqGhz > 0.0 ? format("%.2f GHz", live.cpuFreqGhz) : "CLOCK N/A",
+         live.cpuVoltage > 0.0 ? format("VCORE %.3f V", live.cpuVoltage) : "VCORE N/A"},
+        {"MEMORY", state.ram, live.ram.totalGb > 0.0, 0.65f, 0.85f,
+         format("%.1f / %.1f GB", live.ram.usedGb, live.ram.totalGb), "SYSTEM RAM"},
+        {gpu.loadIsEstimate ? "GPU (EST.)" : "GPU", state.gpu, gpu.hasLoad, 0.50f, 0.85f,
+         gpu.clockGhz > 0.0 ? format("%.2f GHz", gpu.clockGhz) : "CLOCK N/A",
+         !gpuReports         ? "STATS UNAVAILABLE"
+         : !gpu.hasLoad      ? noteValue(gpu.loadNote)
+         : gpu.voltageV > 0.0 ? format("VDDC %.3f V", gpu.voltageV) : "VDDC N/A"},
+        {"VRAM", state.vram, gpu.hasMemory, 0.65f, 0.85f,
+         gpu.hasMemory ? format("%.1f / %.1f GB", gpu.vramUsedGb, gpu.vramTotalGb) : "",
+         gpu.hasMemory ? "VIDEO MEMORY" : gpu.memoryNote.empty() ? "NOT REPORTED" : noteValue(gpu.memoryNote)},
+    }};
+}
+
+// Round gauges side by side: four columns, each with a dial and two readout
+// lines under it. Shared by the skins whose gauges are dials.
+struct DialLayout {
+    float columnWidth, radius, centerY;
+    float centerX(const Box& box, int column) const {
+        return std::floor(box.min.x + columnWidth * (static_cast<float>(column) + 0.5f));
+    }
+};
+
+DialLayout dialLayout(const Box& box) {
+    constexpr float kBelowDial = 16.0f;   // room for the second readout line
+    DialLayout layout;
+    layout.columnWidth = box.width() / 4.0f;
+    layout.radius = std::floor(std::min(layout.columnWidth * 0.40f, (box.height() - kBelowDial) * 0.5f));
+    layout.centerY = std::floor(box.min.y + (box.height() - kBelowDial) * 0.5f);
+    return layout;
+}
+
+// How one HUD skin draws each part of the shared layout.
+struct HudSkin {
+    ImFont* textFont{nullptr};
+    ImFont* displayFont{nullptr};
+    float labelSize{10.0f};   // size of the displayFont labels in the info tables
+    // Label column widths of the graphics, hardware and OS tables; 0 fits the
+    // column to its longest label.
+    struct { float graphics, hardware, system; } labelColumns{0.0f, 0.0f, 0.0f};
+
+    // The window background (drawn behind everything).
+    void (*background)(const ImVec2& windowSize, const HudState& state){};
+    // Title, clock and the gear button. Returns the gear's rectangle.
+    Box (*header)(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state){};
+    // The four gauges, across `box`.
+    void (*gauges)(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live){};
+    // A panel's frame and title. Returns the area left for its contents.
+    Box (*panelFrame)(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state){};
+    // The whole CPU cores panel.
+    void (*cores)(ImDrawList* draw, const Box& box, const HudState& state){};
+    // One "LABEL   value" row of an info table.
+    void (*infoRow)(const HudState& state, const char* label, const std::string& value){};
+    // ImGui colours and spacing (the settings menu, tables and scrollbars use them).
+    void (*style)(ImGuiStyle& style){};
+    // The info tables' label font, if not displayFont (only used to size their column).
+    ImFont* labelFont{nullptr};
+};
+
+// Opens a scrolling area over a panel's content area. Fill it, then call ImGui::EndChild().
+void beginHudPanel(const Box& content, const char* id) {
+    ImGui::SetCursorScreenPos(content.min);
+    ImGui::BeginChild(id, content.max - content.min, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+}
+
+// An info table whose label column is `width` wide, or (if 0) fits the longest of `labels`.
+bool beginHudInfoTable(const HudSkin& skin, const char* id, float width, std::initializer_list<const char*> labels) {
+    if (width <= 0.0f) {
+        ImFont* font = skin.labelFont ? skin.labelFont : skin.displayFont;
+        for (const char* label : labels) width = std::max(width, textSize(font, skin.labelSize, label).x);
+        width = std::ceil(width) + 12.0f;
+    }
+    return beginInfoTable(id, width);
+}
+
+void drawHudGpuPanel(const HudSkin& skin, ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const GpuStats& gpu = live.gpu;
+    beginHudPanel(skin.panelFrame(draw, box, "GRAPHICS", state), "##HudGpu");
+    if (beginHudInfoTable(skin, "HudGpuTable", skin.labelColumns.graphics, {"MODEL", "VENDOR", "CLOCK", "VDDC", "LOAD", "VRAM"})) {
+        skin.infoRow(state, "MODEL", gpu.name);
+        skin.infoRow(state, "VENDOR", vendorName(gpu.vendor));
+        skin.infoRow(state, "CLOCK", gpu.clockGhz > 0.0 ? format("%.2f GHz", gpu.clockGhz) : "N/A");
+        skin.infoRow(state, "VDDC", gpu.voltageV > 0.0 ? format("%.3f V", gpu.voltageV) : "N/A");
+        skin.infoRow(state, "LOAD", gpu.hasLoad ? format("%.1f%%%s", gpu.gpuUsage, gpu.loadIsEstimate ? " (estimated)" : "")
+                                               : gpu.loadNote.empty() ? "N/A" : noteValue(gpu.loadNote));
+        skin.infoRow(state, "VRAM", gpu.hasMemory ? format("%.2f / %.2f GB", gpu.vramUsedGb, gpu.vramTotalGb)
+                                                 : gpu.memoryNote.empty() ? "N/A" : noteValue(gpu.memoryNote));
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+}
+
+void drawHudHardwarePanel(const HudSkin& skin, ImDrawList* draw, const Box& box, const HudState& state, const StaticInfo& info,
+                          const LiveStats& live) {
+    beginHudPanel(skin.panelFrame(draw, box, "HARDWARE", state), "##HudHardware");
+    if (beginHudInfoTable(skin, "HudHardwareTable", skin.labelColumns.hardware, {"PROCESSOR", "MOTHERBOARD", "CHIPSET", "MEMORY", "STORAGE"})) {
+        skin.infoRow(state, "PROCESSOR", info.cpuModel);
+        skin.infoRow(state, "MOTHERBOARD", info.board.name);
+        skin.infoRow(state, "CHIPSET", info.board.chipset);
+        skin.infoRow(state, "MEMORY", format("%.2f GB", live.ram.totalGb));
+        for (const std::string& module : info.ramModules) skin.infoRow(state, "", module);
+        for (size_t i = 0; i < info.drives.size(); ++i) {
+            const DriveInfo& drive = info.drives[i];
+            skin.infoRow(state, i == 0 ? "STORAGE" : "", format("%s  %.0f GB  %s", drive.model.c_str(), drive.sizeGb, drive.type.c_str()));
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+}
+
+void drawHudSystemPanel(const HudSkin& skin, ImDrawList* draw, const Box& box, const HudState& state, const StaticInfo& info,
+                        const LiveStats& live) {
+    beginHudPanel(skin.panelFrame(draw, box, "OPERATING SYSTEM", state), "##HudSystem");
+    if (beginHudInfoTable(skin, "HudSystemTable", skin.labelColumns.system, {"OS", "KERNEL", "UPTIME", "PACKAGES", "SHELL"})) {
+        skin.infoRow(state, "OS", info.os.osName);
+        skin.infoRow(state, "KERNEL", info.os.kernel);
+        skin.infoRow(state, "UPTIME", live.uptime);
+        skin.infoRow(state, "PACKAGES", info.os.packages);
+        skin.infoRow(state, "SHELL", info.os.shell);
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+}
+
+// The whole window in a HUD skin: header, four gauges, then two rows of panels.
+void drawHudDashboard(const ImVec2& windowSize, UiState& ui, const HudSkin& skin, HudState& state, const StaticInfo& info,
+                      const LiveStats& live) {
+    state.textFont = skin.textFont;
+    state.displayFont = skin.displayFont;
+    state.animate = ui.settings.animations;
+    state.time = state.animate ? static_cast<float>(ImGui::GetTime()) : 0.0f;
+    glideHudValues(state, live);
+    skin.background(windowSize, state);
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(windowSize);
+    ImGui::Begin("VeeaStats", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+                                       ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();   // moves up when the window is scrolled
+    const float width = std::floor(ImGui::GetContentRegionAvail().x);
+    const float height = ImGui::GetContentRegionAvail().y;
+
+    // Rows share the window's height but never get too small to read; on small
+    // screens the window scrolls instead.
+    constexpr float kGap = 12.0f, kHeaderHeight = 40.0f;
+    const float dialsNeed = std::floor(width * 0.25f * 0.80f) + 30.0f;   // four dials side by side, plus readouts
+    const float gaugeHeight = std::floor(std::min(std::clamp((height - kHeaderHeight) * 0.38f, 190.0f, 270.0f), dialsNeed));
+    const float rest = std::max(height - kHeaderHeight - gaugeHeight - 3.0f * kGap, 0.0f);
+    const float middleHeight = std::floor(std::max(rest * 0.5f, 150.0f));
+    const float bottomHeight = std::floor(std::max(rest - middleHeight, 170.0f));
+    const float split = origin.x + std::floor(width * 0.58f);   // left/right panel boundary
+
+    const Box gear = skin.header(draw, Box{origin, origin + ImVec2(width, kHeaderHeight)}, ui, state);
+
+    float y = origin.y + kHeaderHeight + kGap;
+    skin.gauges(draw, Box{ImVec2(origin.x, y), ImVec2(origin.x + width, y + gaugeHeight)}, state, live);
+
+    y += gaugeHeight + kGap;
+    skin.cores(draw, Box{ImVec2(origin.x, y), ImVec2(split - kGap * 0.5f, y + middleHeight)}, state);
+    drawHudGpuPanel(skin, draw, Box{ImVec2(split + kGap * 0.5f, y), ImVec2(origin.x + width, y + middleHeight)}, state, live);
+
+    y += middleHeight + kGap;
+    drawHudHardwarePanel(skin, draw, Box{ImVec2(origin.x, y), ImVec2(split - kGap * 0.5f, y + bottomHeight)}, state, info, live);
+    drawHudSystemPanel(skin, draw, Box{ImVec2(split + kGap * 0.5f, y), ImVec2(origin.x + width, y + bottomHeight)}, state, info, live);
+    y += bottomHeight;
+
+    // Tell ImGui how tall everything is, so the window can scroll when it doesn't fit.
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(width, y - origin.y));
+    ImGui::End();
+
+    if (ui.settingsOpen) drawSettingsMenu(ui, gear.min, gear.max);
+}
+
+// The clock and date as shown in the headers: "09:41", "05 OCT 2026".
+void currentClock(std::string& clock, std::string& date) {
+    char clockText[16] = "", dateText[32] = "";
+    const time_t now = time(nullptr);
+    tm local{};
+    localtime_r(&now, &local);
+    strftime(clockText, sizeof(clockText), "%H:%M", &local);
+    strftime(dateText, sizeof(dateText), "%d %b %Y", &local);
+    clock = clockText;
+    date = upperCase(dateText);
+}
+
+// Places the gear button at the right end of a header row. Returns its rectangle.
+Box drawHeaderGear(UiState& ui, float right, float midY) {
+    const float gearSize = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(ImVec2(right - gearSize, midY - gearSize * 0.5f));
+    if (drawGearButton("##Settings", gearSize, ui.settingsOpen)) ui.settingsOpen = !ui.settingsOpen;
+    return Box{ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+}
+
+// ---- JARV ---------------------------------------------------------------------
+// A holographic heads-up-display look: glowing cyan lines on dark navy glass,
+// round gauges, segmented meters and panels with corner brackets.
+//
+// "Glow" is faked by drawing each shape twice more underneath it, wider and very
+// faint. That costs almost nothing and reads like light bleeding off a screen.
+
+const ImVec4 kJarvCyan    (0.25f, 0.85f, 1.00f, 1.0f);     // lines, arcs, headings
+const ImVec4 kJarvIce     (0.86f, 0.97f, 1.00f, 1.0f);     // values
+const ImVec4 kJarvMuted   (0.47f, 0.68f, 0.78f, 1.0f);     // labels
+const ImVec4 kJarvGreen   (0.36f, 1.00f, 0.62f, 1.0f);     // the "live" light
+const ImVec4 kJarvAmber   (1.00f, 0.72f, 0.28f, 1.0f);     // busy
+const ImVec4 kJarvRed     (1.00f, 0.32f, 0.38f, 1.0f);     // critical
+const ImVec4 kJarvGlass   (0.06f, 0.22f, 0.32f, 1.0f);     // panel fill
+const ImVec4 kJarvBgTop   (0.016f, 0.035f, 0.055f, 1.0f);  // window background gradient
+const ImVec4 kJarvBgBottom(0.027f, 0.075f, 0.110f, 1.0f);
+
+// Cyan when relaxed, amber when busy, red when critical (warnAt/critAt are 0..1, as in drawUsageBar).
+const ImVec4& jarvLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kJarvRed : (fraction > warnAt) ? kJarvAmber : kJarvCyan;
+}
+
+// Text with a soft halo: faint copies nudged around it, then the text itself.
+void drawGlowText(ImDrawList* draw, ImFont* font, float size, const ImVec2& pos, const ImVec4& color, const std::string& text) {
+    static const ImVec2 kHalo[] = {{-1.5f, 0.0f}, {1.5f, 0.0f}, {0.0f, -1.5f}, {0.0f, 1.5f}};
+    for (const ImVec2& offset : kHalo) draw->AddText(font, size, pos + offset, withAlpha(color, 0.10f), text.c_str());
+    draw->AddText(font, size, pos, withAlpha(color, 1.0f), text.c_str());
+}
+
+// The faint, wide passes drawn under every glowing shape: {extra thickness, opacity}.
+constexpr float kGlowPasses[][2] = {{7.0f, 0.05f}, {3.5f, 0.12f}};
+
+void drawGlowArc(ImDrawList* draw, const ImVec2& center, float radius, float fromAngle, float toAngle,
+                 const ImVec4& color, float thickness, float alpha = 1.0f) {
+    for (const auto& pass : kGlowPasses) {
+        draw->PathArcTo(center, radius, fromAngle, toAngle);
+        draw->PathStroke(withAlpha(color, pass[1] * alpha), thickness + pass[0]);
+    }
+    draw->PathArcTo(center, radius, fromAngle, toAngle);
+    draw->PathStroke(withAlpha(color, alpha), thickness);
+}
+
+void drawGlowLine(ImDrawList* draw, const ImVec2& from, const ImVec2& to, const ImVec4& color, float thickness, float alpha = 1.0f) {
+    for (const auto& pass : kGlowPasses) draw->AddLine(from, to, withAlpha(color, pass[1] * alpha), thickness + pass[0]);
+    draw->AddLine(from, to, withAlpha(color, alpha), thickness);
+}
+
+// A bar made of separate blocks, like an LED meter.
+void drawSegmentMeter(ImDrawList* draw, const Box& box, float percent, float warnAt, float critAt) {
+    constexpr float kGap = 2.0f;
+    const int count = std::clamp(static_cast<int>(box.width() / 7.0f), 6, 40);
+    const float segmentWidth = (box.width() - kGap * static_cast<float>(count - 1)) / static_cast<float>(count);
+    const float lit = std::clamp(percent, 0.0f, 100.0f) / 100.0f * static_cast<float>(count);
+    const ImVec4& color = jarvLoadColor(percent, warnAt, critAt);
+
+    for (int i = 0; i < count; ++i) {
+        const float left = box.min.x + static_cast<float>(i) * (segmentWidth + kGap);
+        const ImVec2 a(std::floor(left), box.min.y);
+        const ImVec2 b(std::floor(left + segmentWidth), box.max.y);
+        draw->AddRectFilled(a, b, withAlpha(kJarvCyan, 0.08f));
+
+        const float amount = std::clamp(lit - static_cast<float>(i), 0.0f, 1.0f);   // the last block can be part-lit
+        if (amount <= 0.0f) continue;
+        draw->AddRectFilled(a - ImVec2(1.5f, 1.5f), b + ImVec2(1.5f, 1.5f), withAlpha(color, 0.15f * amount));
+        draw->AddRectFilled(a, b, withAlpha(color, amount));
+    }
+}
+
+// Dark navy gradient with a faint grid and darker edges, behind everything.
+void drawJarvBackground(const ImVec2& size, const HudState&) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    const ImU32 top = withAlpha(kJarvBgTop, 1.0f), bottom = withAlpha(kJarvBgBottom, 1.0f);
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), size, top, top, bottom, bottom);
+
+    constexpr float kGridStep = 32.0f;
+    const ImU32 grid = withAlpha(kJarvCyan, 0.035f);
+    for (float x = kGridStep; x < size.x; x += kGridStep) draw->AddLine(ImVec2(x, 0.0f), ImVec2(x, size.y), grid);
+    for (float y = kGridStep; y < size.y; y += kGridStep) draw->AddLine(ImVec2(0.0f, y), ImVec2(size.x, y), grid);
+
+    const float edge = std::min(size.x, size.y) * 0.12f;
+    const ImU32 dark = IM_COL32(0, 0, 0, 110), clear = IM_COL32(0, 0, 0, 0);
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), ImVec2(edge, size.y), dark, clear, clear, dark);
+    draw->AddRectFilledMultiColor(ImVec2(size.x - edge, 0.0f), size, clear, dark, dark, clear);
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, size.y - edge), size, clear, clear, dark, dark);
+}
+
+// Bright corner brackets around `box`, `length` long.
+void drawCornerBrackets(ImDrawList* draw, const Box& box, float length, ImU32 color, float thickness) {
+    const ImVec2 corners[] = {box.min, ImVec2(box.max.x, box.min.y), box.max, ImVec2(box.min.x, box.max.y)};
+    const ImVec2 inwards[] = {ImVec2(1.0f, 1.0f), ImVec2(-1.0f, 1.0f), ImVec2(-1.0f, -1.0f), ImVec2(1.0f, -1.0f)};
+    for (int i = 0; i < 4; ++i) {
+        draw->PathLineTo(ImVec2(corners[i].x + inwards[i].x * length, corners[i].y));
+        draw->PathLineTo(corners[i]);
+        draw->PathLineTo(ImVec2(corners[i].x, corners[i].y + inwards[i].y * length));
+        draw->PathStroke(color, thickness);
+    }
+}
+
+// A glass panel: faint fill, thin border, bright corner brackets and a title
+// strip, plus a slow scan line while animating. Returns the area for content.
+Box drawJarvPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& jarv) {
+    draw->AddRectFilledMultiColor(box.min, box.max, withAlpha(kJarvGlass, 0.30f), withAlpha(kJarvGlass, 0.30f),
+                                  withAlpha(kJarvGlass, 0.10f), withAlpha(kJarvGlass, 0.10f));
+    draw->AddRect(box.min, box.max, withAlpha(kJarvCyan, 0.22f));
+    drawCornerBrackets(draw, box, 12.0f, withAlpha(kJarvCyan, 0.9f), 2.0f);
+
+    // Title strip: "■ TITLE ───────────── ▮▮▮"
+    constexpr float kTitleSize = 11.0f;
+    const ImVec2 titleExtent = textSize(jarv.displayFont, kTitleSize, title);
+    const float titleY = box.min.y + 9.0f;
+    const float midY = std::floor(titleY + titleExtent.y * 0.5f) + 0.5f;
+    draw->AddRectFilled(ImVec2(box.min.x + 10.0f, midY - 2.5f), ImVec2(box.min.x + 15.0f, midY + 2.5f), withAlpha(kJarvCyan, 1.0f));
+    drawGlowText(draw, jarv.displayFont, kTitleSize, ImVec2(box.min.x + 22.0f, titleY), kJarvCyan, title);
+    const float lineLeft = box.min.x + 32.0f + titleExtent.x, lineRight = box.max.x - 34.0f;
+    if (lineRight > lineLeft) draw->AddLine(ImVec2(lineLeft, midY), ImVec2(lineRight, midY), withAlpha(kJarvCyan, 0.22f));
+    for (int i = 0; i < 3; ++i) {
+        const float x = box.max.x - 28.0f + 6.0f * static_cast<float>(i);
+        draw->AddRectFilled(ImVec2(x, midY - 3.0f), ImVec2(x + 3.0f, midY + 3.0f), withAlpha(kJarvCyan, 0.3f + 0.25f * static_cast<float>(i)));
+    }
+
+    // Scan line: a faint band that sweeps down the panel every few seconds.
+    // Each panel starts at a different point so they don't move in lockstep.
+    if (jarv.animate) {
+        constexpr float kSweepSeconds = 6.0f;
+        const float phase = fmodf(jarv.time + (box.min.x + box.min.y) * 0.01f, kSweepSeconds) / kSweepSeconds;
+        const float y = box.min.y + phase * (box.height() + 60.0f) - 30.0f;
+        const ImU32 clear = withAlpha(kJarvCyan, 0.0f), faint = withAlpha(kJarvCyan, 0.06f);
+        draw->PushClipRect(box.min, box.max, true);
+        draw->AddRectFilledMultiColor(ImVec2(box.min.x, y - 30.0f), ImVec2(box.max.x, y), clear, clear, faint, faint);
+        draw->AddLine(ImVec2(box.min.x, y), ImVec2(box.max.x, y), withAlpha(kJarvCyan, 0.16f));
+        draw->PopClipRect();
+    }
+    return Box{ImVec2(box.min.x + 12.0f, titleY + titleExtent.y + 10.0f), ImVec2(box.max.x - 8.0f, box.max.y - 8.0f)};
+}
+
+// A "LABEL   value" table row: small Orbitron label, larger Rajdhani value.
+void drawJarvInfoRow(const HudState& jarv, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(jarv.displayFont, 10.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);   // line the small label up with the taller value
+    ImGui::TextDisabled("%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// A round "arc reactor" gauge: a ring of tick marks, a segmented 270-degree
+// value arc, slowly turning inner rings and the number in the middle.
+void drawJarvGauge(ImDrawList* draw, const ImVec2& center, float radius, const GaugeReading& reading, const HudState& jarv) {
+    constexpr float kStart = kPi * 0.75f;   // the arc runs clockwise from bottom-left...
+    constexpr float kSweep = kPi * 1.5f;    // ...round to bottom-right, leaving the bottom open
+
+    // Tick marks every 5 degrees (longer every 45), except in the bottom opening.
+    for (int i = 0; i < 72; ++i) {
+        if (i > 9 && i < 27) continue;
+        const float angle = 2.0f * kPi * static_cast<float>(i) / 72.0f;
+        const bool major = (i % 9 == 0);
+        draw->AddLine(pointOnCircle(center, radius * (major ? 0.91f : 0.95f), angle), pointOnCircle(center, radius, angle),
+                      withAlpha(kJarvCyan, major ? 0.6f : 0.2f), 1.0f);
+    }
+
+    // The value arc, in 40 separate segments.
+    constexpr int kSegments = 40;
+    const float step = kSweep / kSegments;
+    const float arcRadius = radius * 0.79f;
+    const float thickness = std::max(radius * 0.10f, 4.0f);
+    const float percent = std::clamp(reading.percent, 0.0f, 100.0f);
+    const float lit = reading.hasValue ? percent / 100.0f * kSegments : 0.0f;
+    const ImVec4& color = jarvLoadColor(percent, reading.warnAt, reading.critAt);
+    for (int i = 0; i < kSegments; ++i) {
+        const float from = kStart + step * static_cast<float>(i);
+        const float to = from + step * 0.75f;
+        draw->PathArcTo(center, arcRadius, from, to);
+        draw->PathStroke(withAlpha(kJarvCyan, 0.10f), thickness);
+        const float amount = std::clamp(lit - static_cast<float>(i), 0.0f, 1.0f);
+        if (amount > 0.0f) drawGlowArc(draw, center, arcRadius, from, to, color, thickness, amount);
+    }
+
+    // Thin guide lines either side of the arc, and a bright marker at the current value.
+    for (const float edge : {arcRadius + thickness, arcRadius - thickness}) {
+        draw->PathArcTo(center, edge, kStart, kStart + kSweep);
+        draw->PathStroke(withAlpha(kJarvCyan, 0.22f), 1.0f);
+    }
+    if (reading.hasValue) {
+        const ImVec2 marker = pointOnCircle(center, arcRadius + thickness, kStart + kSweep * percent / 100.0f);
+        draw->AddCircleFilled(marker, 5.0f, withAlpha(kJarvIce, 0.18f));
+        draw->AddCircleFilled(marker, 2.5f, withAlpha(kJarvIce, 1.0f));
+    }
+
+    // Inner rings: three long dashes turning one way, a ring of short dashes the other.
+    const float spin = jarv.time * 0.35f;
+    for (int i = 0; i < 3; ++i) {
+        const float from = spin + 2.0f * kPi * static_cast<float>(i) / 3.0f;
+        drawGlowArc(draw, center, radius * 0.60f, from, from + 1.2f, kJarvCyan, 1.5f, 0.6f);
+    }
+    for (int i = 0; i < 24; ++i) {
+        const float from = -spin * 0.6f + 2.0f * kPi * static_cast<float>(i) / 24.0f;
+        draw->PathArcTo(center, radius * 0.545f, from, from + 0.13f);
+        draw->PathStroke(withAlpha(kJarvCyan, 0.30f), 1.5f);
+    }
+    draw->AddCircleFilled(center, radius * 0.49f, withAlpha(kJarvBgTop, 0.7f));
+    draw->AddCircle(center, radius * 0.49f, withAlpha(kJarvCyan, 0.25f), 0, 1.0f);
+
+    // The number in the middle (with a small "%"), and the label under it.
+    ImFont* display = jarv.displayFont;
+    const float numberSize = std::round(radius * 0.36f);
+    if (reading.hasValue) {
+        const std::string number = format("%.0f", percent);
+        const float signSize = std::round(numberSize * 0.45f);
+        const ImVec2 numberExtent = textSize(display, numberSize, number);
+        const ImVec2 signExtent = textSize(display, signSize, "%");
+        const ImVec2 pos(center.x - (numberExtent.x + signExtent.x + 2.0f) * 0.5f, center.y - numberExtent.y * 0.65f);
+        drawGlowText(draw, display, numberSize, pos, kJarvIce, number);
+        draw->AddText(display, signSize, ImVec2(pos.x + numberExtent.x + 2.0f, pos.y + numberExtent.y - signExtent.y - numberSize * 0.12f),
+                      withAlpha(kJarvCyan, 1.0f), "%");
+    } else {
+        drawCenteredText(draw, display, std::round(numberSize * 0.7f), ImVec2(center.x, center.y - numberSize * 0.25f),
+                         withAlpha(kJarvMuted, 1.0f), "N/A");
+    }
+    drawCenteredText(draw, display, std::max(std::round(radius * 0.12f), 9.0f), ImVec2(center.x, center.y + radius * 0.24f),
+                     withAlpha(kJarvMuted, 1.0f), reading.label);
+
+    // Readouts: the first sits in the arc's opening, the second just below the dial.
+    drawCenteredText(draw, jarv.textFont, 17.0f, ImVec2(center.x, center.y + radius * 0.80f), withAlpha(kJarvIce, 1.0f), reading.line1);
+    drawCenteredText(draw, jarv.textFont, 15.0f, ImVec2(center.x, center.y + radius * 0.80f + 19.0f), withAlpha(kJarvMuted, 1.0f), reading.line2);
+}
+
+void drawJarvGauges(ImDrawList* draw, const Box& box, const HudState& jarv, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(jarv, live);
+    const DialLayout layout = dialLayout(box);
+    for (int i = 0; i < 4; ++i) {
+        drawJarvGauge(draw, ImVec2(layout.centerX(box, i), layout.centerY), layout.radius, readings[i], jarv);
+        if (i > 0) {
+            const float x = box.min.x + layout.columnWidth * static_cast<float>(i);
+            draw->AddLine(ImVec2(x, layout.centerY - layout.radius * 0.6f), ImVec2(x, layout.centerY + layout.radius * 0.6f),
+                          withAlpha(kJarvCyan, 0.12f));
+        }
+    }
+}
+
+void drawJarvCores(ImDrawList* draw, const Box& box, const HudState& jarv) {
+    beginHudPanel(drawJarvPanelFrame(draw, box, format("CORE MATRIX // %zu THREADS", jarv.cores.size()), jarv), "##JarvCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    // As many columns as needed to fit every core without scrolling (up to 4).
+    constexpr float kRowHeight = 22.0f;
+    const int count = static_cast<int>(jarv.cores.size());
+    const int rowsThatFit = std::max(1, static_cast<int>(room.y / kRowHeight));
+    const int columns = std::clamp((count + rowsThatFit - 1) / rowsThatFit, 1, 4);
+    const int rows = (count + columns - 1) / columns;
+    const float columnWidth = std::floor(room.x / static_cast<float>(columns));
+
+    for (int i = 0; i < count; ++i) {
+        const float left = start.x + columnWidth * static_cast<float>(i / rows);   // cores run down each column
+        const float midY = std::floor(start.y + kRowHeight * (static_cast<float>(i % rows) + 0.5f));
+        const std::string name = format("C%02d", i);
+        const ImVec2 nameExtent = textSize(jarv.displayFont, 10.0f, name);
+        panel->AddText(jarv.displayFont, 10.0f, ImVec2(left, midY - nameExtent.y * 0.5f), withAlpha(kJarvMuted, 1.0f), name.c_str());
+
+        drawSegmentMeter(panel, Box{ImVec2(left + 34.0f, midY - 4.0f), ImVec2(left + columnWidth - 56.0f, midY + 4.0f)},
+                         jarv.cores[static_cast<size_t>(i)], 0.50f, 0.80f);
+
+        const std::string value = format("%.0f%%", jarv.cores[static_cast<size_t>(i)]);
+        const ImVec2 valueExtent = textSize(jarv.textFont, 17.0f, value);
+        panel->AddText(jarv.textFont, 17.0f, ImVec2(left + columnWidth - 14.0f - valueExtent.x, midY - valueExtent.y * 0.5f),
+                       withAlpha(kJarvIce, 1.0f), value.c_str());
+    }
+    ImGui::Dummy(ImVec2(room.x, kRowHeight * static_cast<float>(rows)));
+    ImGui::EndChild();
+}
+
+// Title on the left; live light, clock and the gear on the
+// right; a glowing rule underneath. Returns the gear's rectangle.
+Box drawJarvHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& jarv) {
+    ImFont* display = jarv.displayFont;
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 2.0f;
+
+    const ImVec2 titleExtent = textSize(display, 20.0f, "VEEASTATS");
+    drawGlowText(draw, display, 20.0f, ImVec2(box.min.x, midY - titleExtent.y * 0.5f), kJarvCyan, "VEEASTATS");
+    const ImVec2 subtitleExtent = textSize(display, 10.0f, "// SYSTEM DIAGNOSTICS");
+    draw->AddText(display, 10.0f, ImVec2(box.min.x + titleExtent.x + 12.0f, midY - subtitleExtent.y * 0.5f + 2.0f),
+                  withAlpha(kJarvMuted, 1.0f), "// SYSTEM DIAGNOSTICS");
+
+    // Right-hand side, placed from the right edge inwards.
+    const Box gear = drawHeaderGear(ui, box.max.x, midY);
+    float right = gear.min.x - 20.0f;
+
+    std::string clock, date;
+    currentClock(clock, date);
+    const ImVec2 clockExtent = textSize(display, 15.0f, clock);
+    right -= clockExtent.x;
+    draw->AddText(display, 15.0f, ImVec2(right, midY - clockExtent.y * 0.5f), withAlpha(kJarvIce, 1.0f), clock.c_str());
+    const ImVec2 dateExtent = textSize(display, 10.0f, date);
+    right -= dateExtent.x + 10.0f;
+    draw->AddText(display, 10.0f, ImVec2(right, midY - dateExtent.y * 0.5f + 1.0f), withAlpha(kJarvMuted, 1.0f), date.c_str());
+
+    // "● LIVE" - the light pulses gently while animating.
+    const float pulse = jarv.animate ? 0.6f + 0.4f * sinf(jarv.time * 3.0f) : 1.0f;
+    const ImVec2 liveExtent = textSize(display, 10.0f, "LIVE");
+    right -= liveExtent.x + 18.0f;
+    draw->AddCircleFilled(ImVec2(right - 8.0f, midY), 7.0f, withAlpha(kJarvGreen, 0.15f * pulse));
+    draw->AddCircleFilled(ImVec2(right - 8.0f, midY), 3.5f, withAlpha(kJarvGreen, pulse));
+    draw->AddText(display, 10.0f, ImVec2(right + 2.0f, midY - liveExtent.y * 0.5f + 1.0f), withAlpha(kJarvGreen, 1.0f), "LIVE");
+
+    // The rule: faint across the full width, bright where it starts.
+    const float ruleY = box.max.y - 0.5f;
+    draw->AddLine(ImVec2(box.min.x, ruleY), ImVec2(box.max.x, ruleY), withAlpha(kJarvCyan, 0.25f));
+    drawGlowLine(draw, ImVec2(box.min.x, ruleY), ImVec2(box.min.x + 160.0f, ruleY), kJarvCyan, 2.0f);
+    for (int i = 0; i < 4; ++i) {
+        const float x = box.max.x - 6.0f * static_cast<float>(i) - 3.0f;
+        draw->AddRectFilled(ImVec2(x - 3.0f, ruleY - 3.0f), ImVec2(x, ruleY + 1.0f), withAlpha(kJarvCyan, 0.6f));
+    }
+    return gear;
+}
+
+void applyJarvStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.WindowRounding = style.ChildRounding = style.FrameRounding = style.PopupRounding = 0.0f;
+    style.ScrollbarRounding = style.GrabRounding = 0.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 8.0f;
+
+    auto cyan = [](float alpha) { return ImVec4(kJarvCyan.x, kJarvCyan.y, kJarvCyan.z, alpha); };
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = kJarvIce;
+    colors[ImGuiCol_TextDisabled]         = kJarvMuted;
+    colors[ImGuiCol_WindowBg]             = ImVec4(0.02f, 0.05f, 0.08f, 0.96f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(0.02f, 0.05f, 0.08f, 0.96f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = cyan(0.45f);
+    colors[ImGuiCol_FrameBg]              = cyan(0.08f);
+    colors[ImGuiCol_FrameBgHovered]       = cyan(0.22f);
+    colors[ImGuiCol_FrameBgActive]        = cyan(0.32f);
+    colors[ImGuiCol_Button]               = cyan(0.12f);
+    colors[ImGuiCol_ButtonHovered]        = cyan(0.28f);
+    colors[ImGuiCol_ButtonActive]         = cyan(0.40f);
+    colors[ImGuiCol_Header]               = cyan(0.20f);
+    colors[ImGuiCol_HeaderHovered]        = cyan(0.30f);
+    colors[ImGuiCol_HeaderActive]         = cyan(0.40f);
+    colors[ImGuiCol_CheckMark]            = kJarvCyan;
+    colors[ImGuiCol_Separator]            = cyan(0.25f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = cyan(0.25f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = cyan(0.40f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = cyan(0.55f);
+    colors[ImGuiCol_TextSelectedBg]       = cyan(0.25f);
+    colors[ImGuiCol_NavCursor]            = kJarvCyan;
+}
+
 // ---- Galactic Conflict --------------------------------------------------------
 // A starship tactical display: thin electric-blue line work on black, rings of
 // fine tick marks, bar graphs on a grid, and notched panels with gold titles,

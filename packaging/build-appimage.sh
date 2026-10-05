@@ -11,7 +11,11 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_IMAGE="ubuntu:22.04"
-LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+# A fixed linuxdeploy release, checked against its SHA256 before it is run (as
+# CMakeLists.txt does for GLFW). To update: pick a newer tagged release and
+# take the new checksum from its release page.
+LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage"
+LINUXDEPLOY_SHA256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
 
 if [[ "${1:-}" == "--container" ]]; then
     if command -v podman >/dev/null; then engine=podman
@@ -46,8 +50,14 @@ DESTDIR="$APPDIR" cmake --install "$BUILD_DIR"
 
 mkdir -p "$TOOLS_DIR" "$DIST_DIR"
 LINUXDEPLOY="$TOOLS_DIR/linuxdeploy-x86_64.AppImage"
-if [[ ! -x "$LINUXDEPLOY" ]]; then
-    curl -fL --progress-bar -o "$LINUXDEPLOY" "$LINUXDEPLOY_URL"
+if ! echo "$LINUXDEPLOY_SHA256  $LINUXDEPLOY" | sha256sum --check --status 2>/dev/null; then
+    curl -fL --progress-bar -o "$LINUXDEPLOY.download" "$LINUXDEPLOY_URL"
+    if ! echo "$LINUXDEPLOY_SHA256  $LINUXDEPLOY.download" | sha256sum --check --status; then
+        echo "error: linuxdeploy download doesn't match its expected SHA256; not running it" >&2
+        rm -f "$LINUXDEPLOY.download"
+        exit 1
+    fi
+    mv "$LINUXDEPLOY.download" "$LINUXDEPLOY"
     chmod +x "$LINUXDEPLOY"
 fi
 

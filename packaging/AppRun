@@ -22,8 +22,9 @@ notify() {
         notify-send --app-name=VeeaStats --icon="$ICON" "VeeaStats" "$1" 2>/dev/null
 }
 
-# Asks yes/no with whatever dialog tool the desktop has. If no dialog can be
-# shown (none installed, or no display), the user asked explicitly, so proceed.
+# Asks yes/no ($1) with whatever dialog tool the desktop has: returns 0 for yes,
+# 1 for no. If no dialog can be shown (none installed, no display, or the tool
+# failed), returns $2 instead, so each caller decides what silence means.
 confirm() {
     if command -v zenity >/dev/null 2>&1; then
         zenity --question --title="VeeaStats" --text="$1" 2>/dev/null
@@ -33,7 +34,7 @@ confirm() {
         kdialog --title "VeeaStats" --yesno "$1" 2>/dev/null
         case $? in 0) return 0 ;; 1|2) return 1 ;; esac
     fi
-    return 0
+    return "$2"
 }
 
 write_menu_entry() {
@@ -105,11 +106,16 @@ setup_sensor_driver() {
     fi
     command -v pkexec >/dev/null 2>&1 || return
 
-    if ! confirm "VeeaStats can show your CPU voltage (VCore) by turning on your motherboard's sensor driver.
+    # Never ask for the root password without having explained why first: if
+    # the question can't be shown, skip it (and ask again next launch).
+    confirm "VeeaStats can show your CPU voltage (VCore) by turning on your motherboard's sensor driver.
 
-This needs your password once. Turn it on?"; then
-        echo "declined" > "$SENSOR_MARKER"; return
-    fi
+This needs your password once. Turn it on?" 2
+    case $? in
+        0) ;;
+        1) echo "declined" > "$SENSOR_MARKER"; return 0 ;;
+        *) return 0 ;;
+    esac
     pkexec sh -c "$ROOT_ENABLE_SENSORS"
     case $? in
         0) echo "enabled" > "$SENSOR_MARKER"; notify "CPU voltage readings are now turned on." ;;
@@ -119,7 +125,7 @@ This needs your password once. Turn it on?"; then
 }
 
 if [ "$1" = "--uninstall" ]; then
-    confirm "Remove VeeaStats from this computer?" || exit 0
+    confirm "Remove VeeaStats from this computer?" 0 || exit 0   # the user asked for this, so no dialog means yes
     "$HERE/usr/bin/CpuMonitor" --quit   # close it if it's running in the background
     # Ask for the password only if the installer turned the driver on.
     [ -f "$SENSOR_CONF" ] && command -v pkexec >/dev/null 2>&1 && pkexec rm -f "$SENSOR_CONF"

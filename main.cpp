@@ -64,6 +64,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -3744,16 +3745,22 @@ bool loadSymbol(void* library, const char* name, Function& function) {
 constexpr unsigned kRequestShowWindow     = 1u << 0;
 constexpr unsigned kRequestQuit           = 1u << 1;
 constexpr unsigned kRequestToggleOverlay  = 1u << 2;
-constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it opened or closed; see g_overlayActive
+constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it appeared or disappeared; see g_overlayActive
 std::atomic<unsigned> g_requests{0};
 
-// True while the overlay is open (even if hidden for now because its app isn't
-// focused). The main loop only reads stats while someone can see them.
+// True while the overlay is on screen (not while it waits, hidden, for its app
+// to be focused again). The main loop only reads stats while someone can see them.
 std::atomic<bool> g_overlayActive{false};
+
+// The helper threads run until the process ends, so a request can arrive while
+// main() is shutting GLFW down. GLFW may only be woken while it is running.
+std::mutex g_glfwLock;
+bool g_glfwRunning = false;   // guarded by g_glfwLock
 
 void postRequest(unsigned request) {
     g_requests |= request;
-    glfwPostEmptyEvent();   // wakes the main loop if it is sleeping
+    std::lock_guard<std::mutex> lock(g_glfwLock);
+    if (g_glfwRunning) glfwPostEmptyEvent();   // wakes the main loop if it is sleeping
 }
 
 // ---- The overlay process ------------------------------------------------------
@@ -4235,9 +4242,8 @@ ImVec2 drawClassicOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const
 
 // `CpuMonitor --overlay`: the overlay window. Takes orders from the main process
 // on stdin ("stats ...", "skin <id>" (see kSkinChoices), "toggle app" / "toggle
-// screen"), reports hotkey presses ("hotkey") and whether
-// it is open ("active 1" / "active 0") on stdout, and quits when the main
-// process closes the pipe.
+// screen"), reports hotkey presses ("hotkey") and whether it is on screen
+// ("active 1" / "active 0") on stdout, and quits when the main process closes the pipe.
 int runOverlayProcess() {
     prctl(PR_SET_PDEATHSIG, SIGTERM);   // never outlive the main process
 
@@ -4360,18 +4366,19 @@ int runOverlayProcess() {
         if (!mapped) {
             glfwShowWindow(window);
             mapped = true;
+            report(true);
         }
     };
     const auto hideFromScreen = [&] {
         if (!mapped) return;
         glfwHideWindow(window);
         mapped = false;
+        report(false);
     };
     const auto closeOverlay = [&] {
         openedOn = OpenedOn::Nothing;
         target = None;
         hideFromScreen();
-        report(false);
     };
     // The hotkey closes the overlay if it's on screen. Otherwise (closed, or
     // hidden because its app isn't focused) it opens it: on the focused app when
@@ -4391,7 +4398,6 @@ int runOverlayProcess() {
             target = focused;
             openedOn = OpenedOn::Window;
         }
-        report(true);
     };
 
     std::string input;
@@ -4769,13 +4775,29 @@ sockaddr_un instanceSocketAddress(socklen_t& length) {
     return address;
 }
 
-// Reads one line (up to `timeoutMs`), without the newline.
+// Reads one line, without the newline: at most 256 characters and within
+// `timeoutMs` in total, so a stuck or hostile client can't hold the caller.
 std::string readSocketLine(int fd, int timeoutMs) {
+    constexpr size_t kMaxLine = 256;
+    const double deadline = monotonicMs() + timeoutMs;
     std::string line;
     char c;
-    pollfd waitForData{fd, POLLIN, 0};
-    while (poll(&waitForData, 1, timeoutMs) > 0 && read(fd, &c, 1) == 1 && c != '\n') line += c;
+    while (line.size() < kMaxLine) {
+        const int remainingMs = static_cast<int>(deadline - monotonicMs());
+        pollfd waitForData{fd, POLLIN, 0};
+        if (remainingMs <= 0 || poll(&waitForData, 1, remainingMs) <= 0 || read(fd, &c, 1) != 1 || c == '\n') break;
+        line += c;
+    }
     return line;
+}
+
+// True if the other end of `fd` is a process of this same user. Abstract
+// sockets have no file permissions, so any local user could connect to (or
+// take the name of) ours; only copies run by this user are listened to.
+bool peerIsThisUser(int fd) {
+    ucred peer{};
+    socklen_t length = sizeof(peer);
+    return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &length) == 0 && peer.uid == getuid();
 }
 
 // Sends `message` to the running copy and returns its reply ("" if none is running).
@@ -4785,7 +4807,7 @@ std::string messageRunningCopy(const std::string& message) {
     const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return "";
     std::string reply;
-    if (connect(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0) {
+    if (connect(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0 && peerIsThisUser(fd)) {
         const std::string line = message + "\n";
         if (write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size())) reply = readSocketLine(fd, 2000);
     }
@@ -4821,6 +4843,10 @@ void listenForOtherCopies(int listenFd) {
         if (client < 0) {
             if (errno == EINTR) continue;
             return;
+        }
+        if (!peerIsThisUser(client)) {
+            close(client);
+            continue;
         }
         const std::string message = readSocketLine(client, 1000);
         std::string reply;
@@ -4923,6 +4949,10 @@ int main(int argc, char** argv) {
     double lastRefresh = glfwGetTime();
     int framesToDraw = 2;                         // frames to draw back-to-back before sleeping (see below)
 
+    {
+        std::lock_guard<std::mutex> lock(g_glfwLock);
+        g_glfwRunning = true;   // from here on the helper threads may wake the main loop
+    }
     if (instanceSocket >= 0) std::thread(listenForOtherCopies, instanceSocket).detach();
     // On X11 sessions the overlay's own key grab already works in every program.
     if (getenv("WAYLAND_DISPLAY")) std::thread(runShortcutsPortal).detach();
@@ -5035,6 +5065,10 @@ int main(int argc, char** argv) {
         if (inputArrived) framesToDraw = 2;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_glfwLock);
+        g_glfwRunning = false;   // no more wake-ups from the helper threads
+    }
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

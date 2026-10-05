@@ -64,6 +64,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <map>
 #include <mutex>
 #include <cctype>
 #include <cfloat>
@@ -924,7 +927,7 @@ std::string lookupPciDeviceName(const std::string& vendorId, const std::string& 
 
 // Runs ONE long-lived `nvidia-smi --loop-ms` process and reads its output.
 // Starting nvidia-smi every refresh is slow (it can freeze the window for a
-// moment and wastes CPU); a single process that streams a new line at our
+// moment and wastes CPU); a single process that streams a line per GPU at our
 // update interval avoids that completely. If the user picks a different
 // interval, start() is simply called again to replace the process.
 class NvidiaSmiStream {
@@ -936,11 +939,10 @@ public:
 
     bool running() const { return fd_ >= 0; }
 
-    // Starts (or restarts) nvidia-smi so it prints a line every `intervalMs`.
-    // `waitForFirstLineMs` is how long to wait for that first line: wanted at
-    // program start so the first frame has data, but 0 when restarting so the
-    // window never stalls (the old numbers stay on screen until a new line arrives).
-    bool start(int intervalMs, int waitForFirstLineMs) {
+    // Starts (or restarts) nvidia-smi so it prints a line per GPU every
+    // `intervalMs`. Doesn't wait for the first lines: the window never stalls,
+    // and the GPU numbers appear at the next refresh.
+    bool start(int intervalMs) {
         stop();
         buffer_.clear();
 
@@ -957,8 +959,8 @@ public:
 
         const std::string loopArgument = "--loop-ms=" + std::to_string(intervalMs);
         const char* const args[] = {
-            "nvidia-smi", "-i", "0",   // first GPU only
-            "--query-gpu=gpu_name,utilization.gpu,memory.used,memory.total,clocks.current.graphics",
+            "nvidia-smi",   // every NVIDIA GPU, one line each
+            "--query-gpu=index,gpu_name,utilization.gpu,memory.used,memory.total,clocks.current.graphics",
             "--format=csv,noheader,nounits",
             loopArgument.c_str(),
             nullptr};
@@ -975,31 +977,25 @@ public:
         fd_ = pipeEnds[0];
         fcntl(fd_, F_SETFL, O_NONBLOCK);   // reading must never freeze the UI
         fcntl(fd_, F_SETFD, FD_CLOEXEC);
-
-        if (waitForFirstLineMs > 0) {
-            pollfd waitForData{fd_, POLLIN, 0};
-            poll(&waitForData, 1, waitForFirstLineMs);
-        }
         return true;
     }
 
-    // Returns the newest complete line printed since the last call, or "" if none.
-    std::string latestLine() {
-        if (fd_ < 0) return "";
+    // Returns the complete lines printed since the last call (none if nothing new).
+    std::vector<std::string> newLines() {
+        std::vector<std::string> lines;
+        if (fd_ < 0) return lines;
 
         char chunk[512];
         ssize_t bytes;
         while ((bytes = read(fd_, chunk, sizeof(chunk))) > 0) buffer_.append(chunk, static_cast<size_t>(bytes));
         if (bytes == 0) stop();   // nvidia-smi exited
 
-        const size_t lastNewline = buffer_.rfind('\n');
-        if (lastNewline == std::string::npos) return "";
-        size_t lineStart = (lastNewline == 0) ? std::string::npos : buffer_.rfind('\n', lastNewline - 1);
-        lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
-
-        std::string line = buffer_.substr(lineStart, lastNewline - lineStart);
-        buffer_.erase(0, lastNewline + 1);
-        return line;
+        size_t newline;
+        while ((newline = buffer_.find('\n')) != std::string::npos) {
+            lines.push_back(buffer_.substr(0, newline));
+            buffer_.erase(0, newline + 1);
+        }
+        return lines;
     }
 
 private:
@@ -1020,12 +1016,11 @@ private:
     std::string buffer_;
 };
 
-// Parses one line like "NVIDIA GeForce RTX 3080, 12, 1500, 10240, 1800"
-// (name, GPU %, VRAM used MiB, VRAM total MiB, clock MHz).
-GpuStats parseNvidiaLine(const std::string& line) {
-    GpuStats gpu;
-    gpu.vendor = GpuVendor::Nvidia;
-
+// Parses one line like "0, NVIDIA GeForce RTX 3080, 12, 1500, 10240, 1800"
+// (index, name, GPU %, VRAM used MiB, VRAM total MiB, clock MHz) into `gpu`.
+// Each field stands alone: one nvidia-smi can't report ("[N/A]", "[Not
+// Supported]") is just left out. Returns false if the line isn't a GPU line.
+bool parseNvidiaLine(const std::string& line, int& index, GpuStats& gpu) {
     std::vector<std::string> fields;
     size_t start = 0;
     while (true) {
@@ -1034,22 +1029,26 @@ GpuStats parseNvidiaLine(const std::string& line) {
         if (comma == std::string::npos) break;
         start = comma + 1;
     }
-    if (fields.size() < 5) return gpu;
+    double number = 0.0;
+    if (fields.size() < 6 || !parseNumber(fields[0], number)) return false;
+    index = static_cast<int>(number);
 
+    gpu = GpuStats();
+    gpu.vendor = GpuVendor::Nvidia;
+    if (!fields[1].empty() && fields[1][0] != '[') gpu.name = fields[1];
     double usage = 0.0, usedMb = 0.0, totalMb = 0.0, clockMhz = 0.0;
-    if (!parseNumber(fields[1], usage)) return gpu;
-
-    gpu.name = fields[0];
-    gpu.gpuUsage = static_cast<float>(usage);
-    gpu.hasLoad = true;
-    if (parseNumber(fields[2], usedMb) && parseNumber(fields[3], totalMb) && totalMb > 0.0) {
+    if (parseNumber(fields[2], usage)) {
+        gpu.gpuUsage = static_cast<float>(usage);
+        gpu.hasLoad = true;
+    }
+    if (parseNumber(fields[3], usedMb) && parseNumber(fields[4], totalMb) && totalMb > 0.0) {
         gpu.hasMemory = true;
         gpu.vramUsedGb  = usedMb / 1024.0;
         gpu.vramTotalGb = totalMb / 1024.0;
         gpu.vramUsage   = static_cast<float>(100.0 * usedMb / totalMb);
     }
-    if (parseNumber(fields[4], clockMhz)) gpu.clockGhz = clockMhz / 1000.0;
-    return gpu;
+    if (parseNumber(fields[5], clockMhz)) gpu.clockGhz = clockMhz / 1000.0;
+    return true;
 }
 
 // ---- GPU: helpers shared by the AMD / Intel / Mali readers -------------------
@@ -1356,30 +1355,37 @@ GpuStats readMaliGpu(const MaliGpu& mali) {
 
 // ---- GPU: pick the right reader and give the UI one simple interface --------
 
-bool hasNvidiaCard(const std::string& sysRoot) {
-    for (const std::string& cardDir : listGpuCardDirs(sysRoot)) {
-        if (readFirstLine(cardDir + "/device/vendor") == kNvidiaVendorId) return true;
+// True if an NVIDIA graphics card is plugged in. Checked on the PCI bus rather
+// than in /sys/class/drm, because the proprietary driver only appears there
+// with kernel modesetting on.
+bool hasNvidiaGpu(const std::string& sysRoot) {
+    for (const fs::path& device : listDirectory(sysRoot + "/bus/pci/devices")) {
+        const std::string dir = device.string();
+        if (readFirstLine(dir + "/vendor") == kNvidiaVendorId && startsWith(readFirstLine(dir + "/class"), "0x03")) return true;   // 0x03 = display controller
     }
     return false;
 }
 
 class GpuMonitor {
 public:
-    explicit GpuMonitor(const std::string& sysRoot = "/sys") {
+    // `refreshMs` is the update interval, which NVIDIA's nvidia-smi helper is started at.
+    explicit GpuMonitor(int refreshMs, const std::string& sysRoot = "/sys") : nvidiaIntervalMs_(refreshMs) {
         amdCards_   = findAmdCards(sysRoot);
         intelCards_ = findIntelCards(sysRoot);
         mali_       = findMaliGpu(sysRoot);
 
         // If a machine has several kinds of GPU (typical for laptops) the most
-        // powerful one is shown: NVIDIA, then AMD, then Intel, then Mali.
-        if (fileExists("/proc/driver/nvidia/gpus") || commandExists("nvidia-smi")) vendor_ = GpuVendor::Nvidia;
+        // powerful one is shown: NVIDIA, then AMD, then Intel, then Mali. NVIDIA
+        // only counts if a card is actually plugged in: nvidia-smi can be left
+        // installed after the card is swapped for another brand.
+        const bool nvidiaGpu = hasNvidiaGpu(sysRoot);
+        if (nvidiaGpu && (fileExists("/proc/driver/nvidia/gpus") || commandExists("nvidia-smi"))) vendor_ = GpuVendor::Nvidia;
         else if (!amdCards_.empty())   vendor_ = GpuVendor::Amd;
         else if (!intelCards_.empty()) vendor_ = GpuVendor::Intel;
-        else if (hasNvidiaCard(sysRoot)) vendor_ = GpuVendor::Nvidia;   // open "nouveau" driver: no stats, but we know the brand
+        else if (nvidiaGpu)            vendor_ = GpuVendor::Nvidia;   // open "nouveau" driver: no stats, but we know the brand
         else if (mali_)                vendor_ = GpuVendor::Mali;
 
-        nvidiaStats_.vendor = GpuVendor::Nvidia;
-        if (vendor_ == GpuVendor::Nvidia) nvidia_.start(nvidiaIntervalMs_, 2000);
+        if (vendor_ == GpuVendor::Nvidia) startNvidiaSmi();
     }
 
     // Called when the user picks a new update interval. Only NVIDIA needs to
@@ -1388,7 +1394,7 @@ public:
     void setRefreshIntervalMs(int intervalMs) {
         if (vendor_ != GpuVendor::Nvidia || intervalMs == nvidiaIntervalMs_) return;
         nvidiaIntervalMs_ = intervalMs;
-        nvidia_.start(intervalMs, 0);
+        startNvidiaSmi();
     }
 
     GpuStats read() {
@@ -1403,20 +1409,47 @@ public:
     }
 
 private:
+    static constexpr double kNvidiaRetryMs = 10000.0;   // how often to try restarting a stopped nvidia-smi
+
+    void startNvidiaSmi() {
+        lastNvidiaStartMs_ = monotonicMs();
+        nvidia_.start(nvidiaIntervalMs_);
+    }
+
+    // nvidia-smi prints a line per GPU each interval; the newest reading of each
+    // GPU is kept, and the busiest is shown (as for AMD and Intel).
     GpuStats readNvidia() {
-        const std::string line = nvidia_.latestLine();
-        if (!line.empty()) nvidiaStats_ = parseNvidiaLine(line);
-        if (!nvidia_.running()) {   // nvidia-smi is not installed or has stopped
-            nvidiaStats_.hasLoad = false;
-            nvidiaStats_.hasMemory = false;
+        for (const std::string& line : nvidia_.newLines()) {
+            int index = 0;
+            GpuStats gpu;
+            if (parseNvidiaLine(line, index, gpu)) nvidiaCards_[index] = gpu;
         }
-        return nvidiaStats_;
+        if (!nvidia_.running()) {
+            // nvidia-smi isn't installed, or has stopped (after a driver hiccup,
+            // say). Show the GPU as unavailable rather than its last numbers,
+            // and try starting it again every so often.
+            nvidiaCards_.clear();
+            if (monotonicMs() - lastNvidiaStartMs_ >= kNvidiaRetryMs) startNvidiaSmi();
+        }
+        if (nvidiaCards_.empty()) {
+            GpuStats unavailable;
+            unavailable.vendor = GpuVendor::Nvidia;
+            unavailable.name = nvidiaName_;
+            return unavailable;
+        }
+        std::vector<GpuStats> cards;
+        for (const auto& [index, gpu] : nvidiaCards_) cards.push_back(gpu);
+        const GpuStats busiest = pickBusiest(cards);
+        if (busiest.name != GpuStats().name) nvidiaName_ = busiest.name;   // remembered for while it's unavailable
+        return busiest;
     }
 
     GpuVendor vendor_{GpuVendor::Unknown};
-    int nvidiaIntervalMs_{kDefaultRefreshMs};
+    int nvidiaIntervalMs_;
     NvidiaSmiStream nvidia_;
-    GpuStats nvidiaStats_;
+    double lastNvidiaStartMs_{0.0};
+    std::map<int, GpuStats> nvidiaCards_;   // newest reading per GPU index
+    std::string nvidiaName_{GpuStats().name};
     std::vector<AmdCard> amdCards_;
     std::vector<IntelCard> intelCards_;
     std::optional<MaliGpu> mali_;
@@ -1426,7 +1459,9 @@ private:
 
 class LiveMonitor {
 public:
-    LiveMonitor() : previousCpu_(readCpuTimes()), cpuVoltageInputs_(findCpuVoltageInputs()) {
+    // `refreshMs` is the update interval (see GpuMonitor).
+    explicit LiveMonitor(int refreshMs)
+        : previousCpu_(readCpuTimes()), cpuVoltageInputs_(findCpuVoltageInputs()), gpu_(refreshMs) {
         stats_.cpuPercent.assign(previousCpu_.size(), 0.0f);
         readSensors();   // everything except CPU load, which needs two samples
     }
@@ -3746,6 +3781,7 @@ constexpr unsigned kRequestShowWindow     = 1u << 0;
 constexpr unsigned kRequestQuit           = 1u << 1;
 constexpr unsigned kRequestToggleOverlay  = 1u << 2;
 constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it appeared or disappeared; see g_overlayActive
+constexpr unsigned kRequestStaticInfo     = 1u << 4;   // the hardware details are ready (see main)
 std::atomic<unsigned> g_requests{0};
 
 // True while the overlay is on screen (not while it waits, hidden, for its app
@@ -4943,9 +4979,20 @@ int main(int argc, char** argv) {
     const HudSkins hudSkins = makeHudSkins(fonts);
     HudState hud;
 
-    const StaticInfo staticInfo = readStaticInfo();
-    LiveMonitor monitorLive;
-    monitorLive.setRefreshIntervalMs(ui.settings.refreshMs);   // the saved interval
+    // The hardware details are read on a helper thread (counting installed
+    // packages can take a second or two), so the window draws straight away and
+    // fills them in when they arrive.
+    std::promise<StaticInfo> staticInfoPromise;
+    std::future<StaticInfo> staticInfoReady = staticInfoPromise.get_future();
+    std::thread([promise = std::move(staticInfoPromise)]() mutable {
+        promise.set_value(readStaticInfo());
+        postRequest(kRequestStaticInfo);
+    }).detach();
+    StaticInfo staticInfo;   // shown until then
+    staticInfo.cpuModel = staticInfo.board.name = staticInfo.board.chipset = "Reading...";
+    staticInfo.os = {"Reading...", "", "", ""};
+
+    LiveMonitor monitorLive(ui.settings.refreshMs);
     double lastRefresh = glfwGetTime();
     int framesToDraw = 2;                         // frames to draw back-to-back before sleeping (see below)
 
@@ -4964,6 +5011,10 @@ int main(int argc, char** argv) {
     while (true) {
         const unsigned requests = g_requests.exchange(0);
         if (requests & kRequestQuit) break;
+        if (staticInfoReady.valid() && staticInfoReady.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            staticInfo = staticInfoReady.get();
+            framesToDraw = 2;
+        }
         if (requests & kRequestShowWindow) {      // VeeaStats was opened again
             if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) glfwRestoreWindow(window);
             glfwShowWindow(window);

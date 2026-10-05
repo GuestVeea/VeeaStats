@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=VeeaStats
+GenericName=Hardware Monitor
+Comment=Monitor CPU, memory, GPU and drive usage
+Exec=CpuMonitor
+Icon=veeastats
+Terminal=false
+Categories=System;Monitor;
+Keywords=cpu;gpu;ram;hardware;monitor;temperature;
+StartupWMClass=veeastats

@@ -3705,3 +3705,1340 @@ void watchForInput(GLFWwindow* window, bool* inputArrived) {
     glfwSetWindowIconifyCallback(window, [](GLFWwindow* w, int) { markInput(w); });
 }
 
+// ============================================================================
+// 8. OVERLAY, HOTKEY AND BACKGROUND MODE
+// ============================================================================
+//
+// Ctrl+Shift+O shows a small see-through panel with the main numbers on top of
+// whatever the user is doing, usually a game.
+//
+// Wayland doesn't let ordinary windows sit on top of other programs, so the
+// overlay is an X11 window instead (through XWayland on Wayland desktops). An
+// "override-redirect" X11 window is drawn above everything, fullscreen games
+// included, and never takes focus. GLFW talks to only one display system per
+// process, so the overlay runs as a second copy of this program
+// (`CpuMonitor --overlay`) that is sent the numbers through a pipe.
+//
+// The hotkey comes from two places, because neither covers everything:
+//   - The desktop's GlobalShortcuts portal (GNOME 48+, KDE Plasma 6) works in
+//     every program. The desktop asks the user once to confirm the shortcut.
+//   - An X11 key grab in the overlay process works whenever an X11 program has
+//     focus, on any desktop. Proton/Wine games are X11 programs, and on X11
+//     sessions everything is.
+//
+// libX11 and GLib are loaded when first needed (the way GLFW loads its own
+// libraries), so a system without them still runs VeeaStats, just without the
+// overlay or the hotkey.
+
+// Loads `name` from `library` into `function`, keeping the function's real type.
+template <typename Function>
+bool loadSymbol(void* library, const char* name, Function& function) {
+    function = reinterpret_cast<Function>(dlsym(library, name));
+    return function != nullptr;
+}
+
+// ---- Requests from other threads --------------------------------------------
+
+// Other threads (the hotkey portal, a second launch of the program) ask the main
+// loop to do things by setting these bits and waking it up.
+constexpr unsigned kRequestShowWindow     = 1u << 0;
+constexpr unsigned kRequestQuit           = 1u << 1;
+constexpr unsigned kRequestToggleOverlay  = 1u << 2;
+constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it opened or closed; see g_overlayActive
+std::atomic<unsigned> g_requests{0};
+
+// True while the overlay is open (even if hidden for now because its app isn't
+// focused). The main loop only reads stats while someone can see them.
+std::atomic<bool> g_overlayActive{false};
+
+void postRequest(unsigned request) {
+    g_requests |= request;
+    glfwPostEmptyEvent();   // wakes the main loop if it is sleeping
+}
+
+// ---- The overlay process ------------------------------------------------------
+
+// The libX11 functions the overlay uses.
+struct X11Api {
+    decltype(&XInitThreads) initThreads{};
+    decltype(&XOpenDisplay) openDisplay{};
+    decltype(&XDefaultRootWindow) defaultRootWindow{};
+    decltype(&XKeysymToKeycode) keysymToKeycode{};
+    decltype(&XGrabKey) grabKey{};
+    decltype(&XSync) sync{};
+    decltype(&XNextEvent) nextEvent{};
+    decltype(&XSetErrorHandler) setErrorHandler{};
+    decltype(&XInternAtom) internAtom{};
+    decltype(&XGetWindowProperty) getWindowProperty{};
+    decltype(&XFree) free{};
+    decltype(&XGetWindowAttributes) getWindowAttributes{};
+    decltype(&XTranslateCoordinates) translateCoordinates{};
+    decltype(&XChangeWindowAttributes) changeWindowAttributes{};
+    decltype(&XMoveWindow) moveWindow{};
+
+    bool load() {
+        void* library = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+        return library && loadSymbol(library, "XInitThreads", initThreads) && loadSymbol(library, "XOpenDisplay", openDisplay) &&
+               loadSymbol(library, "XDefaultRootWindow", defaultRootWindow) &&
+               loadSymbol(library, "XKeysymToKeycode", keysymToKeycode) && loadSymbol(library, "XGrabKey", grabKey) &&
+               loadSymbol(library, "XSync", sync) && loadSymbol(library, "XNextEvent", nextEvent) &&
+               loadSymbol(library, "XSetErrorHandler", setErrorHandler) && loadSymbol(library, "XInternAtom", internAtom) &&
+               loadSymbol(library, "XGetWindowProperty", getWindowProperty) && loadSymbol(library, "XFree", free) &&
+               loadSymbol(library, "XGetWindowAttributes", getWindowAttributes) &&
+               loadSymbol(library, "XTranslateCoordinates", translateCoordinates) &&
+               loadSymbol(library, "XChangeWindowAttributes", changeWindowAttributes) &&
+               loadSymbol(library, "XMoveWindow", moveWindow);
+    }
+};
+
+// X11 reports errors (for example, another program already owns Ctrl+Shift+O)
+// to this handler. The default one exits the program; none of them is worth that.
+int ignoreX11Error(Display*, XErrorEvent*) {
+    return 0;
+}
+
+// The numbers the overlay shows, sent over by the main process as one line:
+// "stats <cpu %> <cpu V> <ram %> <ram used GB> <ram total GB> <gpu has load> <gpu %> <gpu V>".
+struct OverlayNumbers {
+    float cpuPercent{0.0f}, cpuVolts{0.0f};
+    float ramPercent{0.0f}, ramUsedGb{0.0f}, ramTotalGb{0.0f};
+    int gpuHasLoad{0};
+    float gpuPercent{0.0f}, gpuVolts{0.0f};
+};
+
+std::string overlayStatsLine(const LiveStats& live) {
+    return format("stats %.1f %.3f %.1f %.2f %.2f %d %.1f %.3f\n", averageCpuPercent(live), live.cpuVoltage, live.ram.percent,
+                  live.ram.usedGb, live.ram.totalGb, live.gpu.hasLoad ? 1 : 0, live.gpu.gpuUsage, live.gpu.voltageV);
+}
+
+bool parseOverlayStatsLine(const std::string& line, OverlayNumbers& numbers) {
+    OverlayNumbers parsed;
+    if (sscanf(line.c_str(), "stats %f %f %f %f %f %d %f %f", &parsed.cpuPercent, &parsed.cpuVolts, &parsed.ramPercent,
+               &parsed.ramUsedGb, &parsed.ramTotalGb, &parsed.gpuHasLoad, &parsed.gpuPercent, &parsed.gpuVolts) != 8) {
+        return false;
+    }
+    numbers = parsed;
+    return true;
+}
+
+// Watches for Ctrl+Shift+O on its own X11 connection (X11 connections can't be
+// shared between threads) and tells the main process "hotkey" on every press.
+// Runs for the life of the overlay process.
+void watchX11Hotkey(const X11Api* x11) {
+    Display* display = x11->openDisplay(nullptr);
+    if (!display) return;
+    const Window root = x11->defaultRootWindow(display);
+    const KeyCode key = x11->keysymToKeycode(display, XK_o);
+    // A grab only matches the exact modifiers, so ask again with Caps Lock and Num Lock on.
+    for (const unsigned locks : {0u, unsigned(LockMask), unsigned(Mod2Mask), unsigned(LockMask | Mod2Mask)}) {
+        x11->grabKey(display, key, ControlMask | ShiftMask | locks, root, False, GrabModeAsync, GrabModeAsync);
+    }
+    x11->sync(display, False);
+
+    // Holding the keys down repeats the press; only the first one counts.
+    constexpr Time kRepeatGapMs = 500;
+    Time lastPress = 0;
+    XEvent event;
+    while (true) {
+        x11->nextEvent(display, &event);
+        if (event.type != KeyPress) continue;
+        const bool repeat = lastPress != 0 && event.xkey.time - lastPress < kRepeatGapMs;
+        lastPress = event.xkey.time;
+        if (!repeat && write(STDOUT_FILENO, "hotkey\n", 7) < 0) return;
+    }
+}
+
+constexpr float kOverlayMargin = 12.0f;   // gap between the window's corner and the overlay
+
+// The focused window, if it's one the overlay can sit on: an X11 window the user
+// works in (Proton/Wine games are X11). None while a Wayland window has focus:
+// Wayland doesn't tell other programs about its windows, and GNOME then reports
+// a hidden 1x1 helper window as the active X11 window.
+Window focusedX11Window(const X11Api& x11, Display* display, Window overlayWindow) {
+    static const Atom activeWindowAtom = x11.internAtom(display, "_NET_ACTIVE_WINDOW", False);
+    Window active = None;
+    Atom type;
+    int format;
+    unsigned long count, remaining;
+    unsigned char* data = nullptr;
+    if (x11.getWindowProperty(display, x11.defaultRootWindow(display), activeWindowAtom, 0, 1, False, XA_WINDOW, &type,
+                              &format, &count, &remaining, &data) == Success && data) {
+        if (count == 1) active = *reinterpret_cast<Window*>(data);
+        x11.free(data);
+    }
+
+    XWindowAttributes attributes;
+    constexpr int kSmallestWindow = 100;   // anything smaller is a helper, not something the user works in
+    const bool usable = active != None && active != overlayWindow && x11.getWindowAttributes(display, active, &attributes) &&
+                        attributes.map_state == IsViewable && !attributes.override_redirect &&
+                        attributes.width >= kSmallestWindow && attributes.height >= kSmallestWindow;
+    return usable ? active : None;
+}
+
+// Top-left corner of `window` on the screen, or nothing if the window no longer
+// exists (its program has closed).
+std::optional<ImVec2> windowCorner(const X11Api& x11, Display* display, Window window) {
+    XWindowAttributes attributes;
+    int x = 0, y = 0;
+    Window child;
+    if (!x11.getWindowAttributes(display, window, &attributes) ||
+        !x11.translateCoordinates(display, window, x11.defaultRootWindow(display), 0, 0, &x, &y, &child)) {
+        return std::nullopt;
+    }
+    return ImVec2(static_cast<float>(x), static_cast<float>(y));
+}
+
+// Top-left corner of the main screen's usable area, below GNOME's top bar or any
+// other panel. GNOME lists each screen's usable area in _GTK_WORKAREAS_D0; other
+// desktops give one area covering all screens in _NET_WORKAREA. (GLFW's
+// glfwGetMonitorWorkarea also needs _NET_CURRENT_DESKTOP, which GNOME doesn't set.)
+ImVec2 screenCorner(const X11Api& x11, Display* display) {
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    int monitorX = 0, monitorY = 0;
+    glfwGetMonitorPos(monitor, &monitorX, &monitorY);
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    const long monitorRight = monitorX + (mode ? mode->width : 0), monitorBottom = monitorY + (mode ? mode->height : 0);
+
+    for (const char* property : {"_GTK_WORKAREAS_D0", "_NET_WORKAREA"}) {
+        Atom type;
+        int format;
+        unsigned long count, remaining;
+        unsigned char* data = nullptr;
+        if (x11.getWindowProperty(display, x11.defaultRootWindow(display), x11.internAtom(display, property, False), 0, 64,
+                                  False, AnyPropertyType, &type, &format, &count, &remaining, &data) != Success || !data) {
+            continue;
+        }
+        // Rectangles as (x, y, width, height); use the first that overlaps the main screen.
+        const long* rects = reinterpret_cast<const long*>(data);
+        std::optional<ImVec2> corner;
+        for (unsigned long i = 0; i + 3 < count && format == 32 && !corner; i += 4) {
+            const long left = std::max<long>(rects[i], monitorX), top = std::max<long>(rects[i + 1], monitorY);
+            const long right = std::min<long>(rects[i] + rects[i + 2], monitorRight);
+            const long bottom = std::min<long>(rects[i + 1] + rects[i + 3], monitorBottom);
+            if (left < right && top < bottom) corner = ImVec2(static_cast<float>(left), static_cast<float>(top));
+        }
+        x11.free(data);
+        if (corner) return *corner;
+    }
+    return ImVec2(static_cast<float>(monitorX), static_cast<float>(monitorY));
+}
+
+// The overlay is drawn in the active skin's style, at the window's top-left.
+// Each look returns the panel's size, and the window is fitted to it:
+//   CPU  34%  1.208 V
+//   RAM  41%  12.5 / 30.5 GB
+//   GPU  67%  0.812 V
+struct OverlayRow {
+    const char* label;
+    bool hasPercent;
+    float percent, warnAt, critAt;
+    std::string detail;
+    bool detailIsVoltage;   // shown in the voltage colour (Classic)
+};
+
+std::vector<OverlayRow> overlayRows(const OverlayNumbers& numbers) {
+    return {
+        {"CPU", true, numbers.cpuPercent, 0.50f, 0.80f, numbers.cpuVolts > 0.0f ? format("%.3f V", numbers.cpuVolts) : "N/A", true},
+        {"RAM", numbers.ramTotalGb > 0.0f, numbers.ramPercent, 0.65f, 0.85f,
+         format("%.1f / %.1f GB", numbers.ramUsedGb, numbers.ramTotalGb), false},
+        {"GPU", numbers.gpuHasLoad != 0, numbers.gpuPercent, 0.50f, 0.85f,
+         numbers.gpuVolts > 0.0f ? format("%.3f V", numbers.gpuVolts) : "N/A", true},
+    };
+}
+
+// JARV: see-through glass with corner brackets, an LED meter and glowing numbers.
+// Kept faint so it doesn't pull the eye from the game; a dark shadow under the
+// text keeps it readable over bright scenes.
+ImVec2 drawJarvOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kLabelSize = 11.0f, kValueSize = 22.0f, kDetailSize = 17.0f;
+    constexpr float kPaddingX = 12.0f, kPaddingY = 7.0f, kRowHeight = 24.0f, kColumnGap = 10.0f;
+    constexpr float kMeterWidth = 64.0f, kMeterHeight = 7.0f;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.jarvDisplay, kLabelSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.jarvText, kDetailSize, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.jarvText, kValueSize, "100%").x;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + labelWidth + kMeterWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size())));
+
+    // Glass, a faint border, and bright corner brackets (as on the JARV panels).
+    draw->AddRectFilledMultiColor(ImVec2(0, 0), size, withAlpha(kJarvBgTop, 0.42f), withAlpha(kJarvBgTop, 0.42f),
+                                  withAlpha(kJarvBgTop, 0.30f), withAlpha(kJarvBgTop, 0.30f));
+    draw->AddRect(ImVec2(0.5f, 0.5f), size - ImVec2(0.5f, 0.5f), withAlpha(kJarvCyan, 0.16f));
+    constexpr float kBracket = 8.0f;
+    const ImVec2 corners[] = {ImVec2(1, 1), ImVec2(size.x - 1, 1), size - ImVec2(1, 1), ImVec2(1, size.y - 1)};
+    const ImVec2 inwards[] = {ImVec2(1, 1), ImVec2(-1, 1), ImVec2(-1, -1), ImVec2(1, -1)};
+    for (int i = 0; i < 4; ++i) {
+        draw->PathLineTo(ImVec2(corners[i].x + inwards[i].x * kBracket, corners[i].y));
+        draw->PathLineTo(corners[i]);
+        draw->PathLineTo(ImVec2(corners[i].x, corners[i].y + inwards[i].y * kBracket));
+        draw->PathStroke(withAlpha(kJarvCyan, 0.75f), 1.5f);
+    }
+
+    const auto shadowedText = [&](ImFont* font, float fontSize, ImVec2 pos, ImU32 color, const std::string& text) {
+        draw->AddText(font, fontSize, pos + ImVec2(1.0f, 1.0f), IM_COL32(0, 0, 0, 150), text.c_str());
+        draw->AddText(font, fontSize, pos, color, text.c_str());
+    };
+
+    float rowTop = kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = rowTop + kRowHeight * 0.5f;
+        float x = kPaddingX;
+        const ImVec2 labelExtent = textSize(fonts.jarvDisplay, kLabelSize, row.label);
+        shadowedText(fonts.jarvDisplay, kLabelSize, ImVec2(x, midY - labelExtent.y * 0.5f), withAlpha(kJarvCyan, 0.95f), row.label);
+        x += labelWidth + kColumnGap;
+
+        const float meterTop = std::floor(midY - kMeterHeight * 0.5f);
+        drawSegmentMeter(draw, Box{ImVec2(x, meterTop), ImVec2(x + kMeterWidth, meterTop + kMeterHeight)},
+                         row.hasPercent ? row.percent : 0.0f, row.warnAt, row.critAt);
+        x += kMeterWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const ImVec4& valueColor = row.hasPercent ? jarvLoadColor(row.percent, row.warnAt, row.critAt) : kJarvMuted;
+        const ImVec2 valueExtent = textSize(fonts.jarvText, kValueSize, value);
+        shadowedText(fonts.jarvText, kValueSize, ImVec2(x + valueWidth - valueExtent.x, midY - valueExtent.y * 0.5f),
+                     withAlpha(valueColor, 1.0f), value);
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.jarvText, kDetailSize, row.detail);
+        shadowedText(fonts.jarvText, kDetailSize, ImVec2(x, midY - detailExtent.y * 0.5f), withAlpha(kJarvIce, 0.85f), row.detail);
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
+// Galactic Conflict: a notched dark panel with blue line work. Each row has a
+// comb of ticks that light up to the value.
+ImVec2 drawGalacticOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kLabelSize = 10.0f, kValueSize = 15.0f, kDetailSize = 16.0f;
+    constexpr float kPaddingX = 16.0f, kPaddingY = 8.0f, kRowHeight = 24.0f, kColumnGap = 10.0f;
+    constexpr int kTicks = 20;
+    constexpr float kTickStep = 3.0f, kCombWidth = kTicks * kTickStep;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.galacticDisplay, kLabelSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.galacticText, kDetailSize, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.galacticDisplay, kValueSize, "100").x + textSize(fonts.galacticText, kValueSize, "%").x + 2.0f;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + labelWidth + kCombWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size())));
+
+    const std::array<ImVec2, 6> outline = notchedCorners(Box{ImVec2(0.5f, 0.5f), size - ImVec2(0.5f, 0.5f)}, 8.0f);
+    draw->AddConvexPolyFilled(outline.data(), static_cast<int>(outline.size()), withAlpha(kGcPanel, 0.50f));
+    draw->AddPolyline(outline.data(), static_cast<int>(outline.size()), withAlpha(kGcBlue, 0.60f), ImDrawFlags_Closed, 1.0f);
+    draw->AddRectFilled(ImVec2(size.x - 14.0f, 4.0f), ImVec2(size.x - 6.0f, 6.0f), withAlpha(kGcRed, 0.9f));
+
+    const auto shadowedText = [&](ImFont* font, float fontSize, ImVec2 pos, ImU32 color, const std::string& text) {
+        draw->AddText(font, fontSize, pos + ImVec2(1.0f, 1.0f), IM_COL32(0, 0, 0, 160), text.c_str());
+        draw->AddText(font, fontSize, pos, color, text.c_str());
+    };
+
+    float rowTop = kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = rowTop + kRowHeight * 0.5f;
+        float x = kPaddingX;
+        const ImVec2 labelExtent = textSize(fonts.galacticDisplay, kLabelSize, row.label);
+        shadowedText(fonts.galacticDisplay, kLabelSize, ImVec2(x, std::floor(midY - labelExtent.y * 0.5f)), withAlpha(kGcSky, 1.0f), row.label);
+        x += labelWidth + kColumnGap;
+
+        const ImVec4& color = galacticLoadColor(row.percent, row.warnAt, row.critAt);
+        const float lit = row.hasPercent ? std::clamp(row.percent, 0.0f, 100.0f) / 100.0f * kTicks : 0.0f;
+        for (int i = 0; i < kTicks; ++i) {
+            const float tickX = std::floor(x + kTickStep * static_cast<float>(i)) + 0.5f;
+            const bool on = static_cast<float>(i) < lit;
+            draw->AddLine(ImVec2(tickX, midY - (on ? 5.0f : 4.0f)), ImVec2(tickX, midY + (on ? 5.0f : 4.0f)),
+                          on ? withAlpha(color, 1.0f) : withAlpha(kGcBlue, 0.30f), on ? 1.5f : 1.0f);
+        }
+        x += kCombWidth + kColumnGap;
+
+        // The number in Michroma, its "%" in Saira (Michroma's looks like "o/o").
+        const ImVec4& valueColor = !row.hasPercent ? kGcSky : (row.percent / 100.0f > row.warnAt) ? color : kGcWhite;
+        const std::string number = row.hasPercent ? format("%.0f", row.percent) : "N/A";
+        const ImVec2 numberExtent = textSize(fonts.galacticDisplay, kValueSize, number);
+        const float signWidth = row.hasPercent ? textSize(fonts.galacticText, kValueSize, "%").x + 2.0f : 0.0f;
+        const float numberLeft = x + valueWidth - signWidth - numberExtent.x;
+        shadowedText(fonts.galacticDisplay, kValueSize, ImVec2(numberLeft, std::floor(midY - numberExtent.y * 0.5f)), withAlpha(valueColor, 1.0f),
+                     number);
+        if (row.hasPercent) {
+            const ImVec2 signExtent = textSize(fonts.galacticText, kValueSize, "%");
+            shadowedText(fonts.galacticText, kValueSize, ImVec2(numberLeft + numberExtent.x + 2.0f, std::floor(midY - signExtent.y * 0.5f)),
+                         withAlpha(valueColor, 1.0f), "%");
+        }
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.galacticText, kDetailSize, row.detail);
+        shadowedText(fonts.galacticText, kDetailSize, ImVec2(x, std::floor(midY - detailExtent.y * 0.5f)), withAlpha(kGcSky, 1.0f), row.detail);
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
+// Federation Gunship: a see-through dialogue box in outlined pixel text, with
+// five energy tanks per row (one per 20%).
+ImVec2 drawGunshipOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kPaddingX = 14.0f, kPaddingY = 10.0f, kRowHeight = 22.0f, kColumnGap = 10.0f;
+    constexpr int kTanks = 5;
+    constexpr float kTank = 8.0f, kTankGap = 4.0f, kTanksWidth = kTanks * kTank + (kTanks - 1) * kTankGap;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.gunshipDisplay, 8.0f, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.gunshipText, 16.0f, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.gunshipDisplay, 16.0f, "100%").x;
+    const ImVec2 size = snapToPixel(ImVec2(kPaddingX * 2.0f + labelWidth + kTanksWidth + valueWidth + detailWidth + kColumnGap * 3.0f + kPx,
+                                           kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size()) + kPx));
+    drawPixelBox(draw, Box{ImVec2(0.0f, 0.0f), size}, 0.62f);
+
+    float rowTop = kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = snapToPixel(rowTop + kRowHeight * 0.5f);
+        float x = kPaddingX;
+        drawOutlinedText(draw, fonts.gunshipDisplay, 8.0f, ImVec2(x, midY - 4.0f), kFgYellow, row.label);
+        x += labelWidth + kColumnGap;
+
+        const ImVec4& color = gunshipLoadColor(row.percent, row.warnAt, row.critAt);
+        const int lit = row.hasPercent ? static_cast<int>(std::lround(std::clamp(row.percent, 0.0f, 100.0f) / 20.0f)) : 0;
+        drawEnergyTanks(draw, ImVec2(x, midY - kTank * 0.5f), kTanks, lit, kTank, kTankGap, color);
+        x += kTanksWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const float valueLeft = x + valueWidth - textSize(fonts.gunshipDisplay, 16.0f, value).x;
+        drawOutlinedText(draw, fonts.gunshipDisplay, 16.0f, ImVec2(valueLeft, midY - 8.0f), row.hasPercent ? kFgWhite : kFgGray, value, kPx);
+        x += valueWidth + kColumnGap;
+
+        drawOutlinedText(draw, fonts.gunshipText, 16.0f, ImVec2(x, midY - 9.0f), kFgWhite, row.detail);
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
+// Halloween: a see-through stone slab with a cobweb in the corner; each row
+// has a chunky goo bar.
+ImVec2 drawHalloweenOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kLabelSize = 20.0f, kValueSize = 26.0f, kDetailSize = 15.0f;   // Henny Penny runs small (see above)
+    constexpr float kPaddingX = 16.0f, kPaddingY = 8.0f, kRowHeight = 27.0f, kColumnGap = 10.0f;
+    constexpr float kBarWidth = 64.0f, kBarHeight = 10.0f;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.halloweenDisplay, kLabelSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.halloweenText, kDetailSize, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.halloweenDisplay, kValueSize, "100%").x;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + labelWidth + kBarWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size())));
+
+    // Inset by the slab's outline and shadow so they stay inside the window.
+    const Box slab{ImVec2(4.0f, 4.0f), size + ImVec2(4.0f, 4.0f)};
+    drawStoneSlab(draw, slab, 12.0f, 0.55f);
+    drawCobweb(draw, ImVec2(slab.max.x - 3.0f, slab.min.y + 3.0f), 24.0f, -1.0f, 1.0f, 0.45f);
+
+    float rowTop = slab.min.y + kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = std::floor(rowTop + kRowHeight * 0.5f);
+        float x = slab.min.x + kPaddingX;
+        const ImVec2 labelExtent = textSize(fonts.halloweenDisplay, kLabelSize, row.label);
+        drawHalloweenText(draw, fonts.halloweenDisplay, kLabelSize, ImVec2(x, midY - labelExtent.y * 0.5f), kHwOrange, row.label, 1.5f);
+        x += labelWidth + kColumnGap;
+
+        // A chunky bar: outlined dark track, the value in goo, a glossy line along the top.
+        const ImVec2 barA(x, midY - kBarHeight * 0.5f), barB(x + kBarWidth, midY + kBarHeight * 0.5f);
+        draw->AddRectFilled(barA - ImVec2(2.0f, 2.0f), barB + ImVec2(2.0f, 2.0f), withAlpha(kHwOutline, 1.0f), kBarHeight * 0.5f + 2.0f);
+        draw->AddRectFilled(barA, barB, withAlpha(kHwPlaque, 1.0f), kBarHeight * 0.5f);
+        if (row.hasPercent && row.percent > 0.5f) {
+            const float fillRight = barA.x + std::max(kBarHeight, kBarWidth * std::clamp(row.percent, 0.0f, 100.0f) / 100.0f);
+            draw->AddRectFilled(barA, ImVec2(fillRight, barB.y), withAlpha(halloweenLoadColor(row.percent, row.warnAt, row.critAt), 1.0f), kBarHeight * 0.5f);
+            draw->AddLine(ImVec2(barA.x + 4.0f, barA.y + 2.5f), ImVec2(fillRight - 4.0f, barA.y + 2.5f), withAlpha(kHwBone, 0.45f), 1.5f);
+        }
+        x += kBarWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const ImVec2 valueExtent = textSize(fonts.halloweenDisplay, kValueSize, value);
+        drawHalloweenText(draw, fonts.halloweenDisplay, kValueSize, ImVec2(x + valueWidth - valueExtent.x, midY - valueExtent.y * 0.5f),
+                          row.hasPercent ? kHwBone : kHwMist, value);
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.halloweenText, kDetailSize, row.detail);
+        drawHalloweenText(draw, fonts.halloweenText, kDetailSize, ImVec2(x, midY - detailExtent.y * 0.5f), kHwBone, row.detail, 1.0f);
+        rowTop += kRowHeight;
+    }
+    return slab.max + ImVec2(6.0f, 8.0f);   // past the slab's outline and shadow
+}
+
+// Classic: looks like a small ImGui window from the main window's sections:
+// the same heading colours and green / orange / red usage bars. It is drawn
+// with shapes in ImGui's own Classic style colours rather than with widgets,
+// because ImGui won't size a window larger than the one it is drawing in, and
+// the overlay window has to be fitted to the panel.
+ImVec2 drawClassicOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    const ImVec4 labelColors[] = {kCpuHeading, kRamHeading, kGpuHeading};
+    ImFont* font = fonts.classic;
+    constexpr float kFontSize = 13.0f, kBarWidth = 120.0f;   // ProggyClean's size; the bar as in the old widget version
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(font, kFontSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(font, kFontSize, row.detail).x);
+    }
+    const float frameHeight = kFontSize + style.FramePadding.y * 2.0f;
+    const float rowHeight = frameHeight + style.CellPadding.y * 2.0f;
+    const float columnGap = style.CellPadding.x * 2.0f;
+    const ImVec2 size(std::ceil(style.WindowPadding.x * 2.0f + labelWidth + columnGap + kBarWidth + columnGap + detailWidth),
+                      std::ceil(style.WindowPadding.y * 2.0f + rowHeight * static_cast<float>(rows.size())));
+
+    ImVec4 background = style.Colors[ImGuiCol_WindowBg];
+    background.w = 0.80f;
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), size, ImGui::ColorConvertFloat4ToU32(background));
+    draw->AddRect(ImVec2(0.0f, 0.0f), size, ImGui::GetColorU32(ImGuiCol_Border));
+
+    float top = style.WindowPadding.y + style.CellPadding.y;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const OverlayRow& row = rows[i];
+        const float textY = top + style.FramePadding.y;
+        float x = style.WindowPadding.x;
+        draw->AddText(font, kFontSize, ImVec2(x, textY), withAlpha(labelColors[i], 1.0f), row.label);
+        x += labelWidth + columnGap;
+
+        // A ProgressBar: frame, fill, and the text just past the end of the fill.
+        const ImVec2 barMin(x, top), barMax(x + kBarWidth, top + frameHeight);
+        draw->AddRectFilled(barMin, barMax, ImGui::GetColorU32(ImGuiCol_FrameBg), style.FrameRounding);
+        const float fraction = row.hasPercent ? std::clamp(row.percent / 100.0f, 0.0f, 1.0f) : 0.0f;
+        const float fillRight = barMin.x + kBarWidth * fraction;
+        if (fraction > 0.0f) {
+            draw->AddRectFilled(barMin, ImVec2(fillRight, barMax.y), withAlpha(usageColor(row.percent, row.warnAt, row.critAt), 1.0f),
+                                style.FrameRounding);
+        }
+        const std::string value = row.hasPercent ? format("%.1f%%", row.percent) : "N/A";
+        const float valueWidth = textSize(font, kFontSize, value).x;
+        const float valueX = std::clamp(fillRight + style.ItemSpacing.x, barMin.x, barMax.x - valueWidth - style.ItemInnerSpacing.x);
+        draw->AddText(font, kFontSize, ImVec2(std::floor(valueX), textY), ImGui::GetColorU32(ImGuiCol_Text), value.c_str());
+        x += kBarWidth + columnGap;
+
+        const ImU32 detailColor = row.detail == "N/A"  ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
+                                  : row.detailIsVoltage ? withAlpha(kVoltageColor, 1.0f)
+                                                        : ImGui::GetColorU32(ImGuiCol_Text);
+        draw->AddText(font, kFontSize, ImVec2(x, textY), detailColor, row.detail.c_str());
+        top += rowHeight;
+    }
+    return size;
+}
+
+// `CpuMonitor --overlay`: the overlay window. Takes orders from the main process
+// on stdin ("stats ...", "skin <id>" (see kSkinChoices), "toggle app" / "toggle
+// screen"), reports hotkey presses ("hotkey") and whether
+// it is open ("active 1" / "active 0") on stdout, and quits when the main
+// process closes the pipe.
+int runOverlayProcess() {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);   // never outlive the main process
+
+    static X11Api x11;   // static: the hotkey thread uses it until the process ends
+    if (!x11.load()) return 1;
+    x11.initThreads();   // two threads use X11; older libX11 versions need to be told
+    x11.setErrorHandler(ignoreX11Error);
+
+    glfwSetErrorCallback(onGlfwError);
+    glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+    if (!glfwInit()) return 1;
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
+    glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
+    glfwWindowHint(GLFW_MOUSE_PASSTHROUGH, GLFW_TRUE);   // clicks go to the game underneath
+    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE);
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "veeastats");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "veeastats-overlay");
+    // Any size: the first frame fits the window to the panel (see drawFrame).
+    GLFWwindow* window = glfwCreateWindow(240, 90, "VeeaStats Overlay", nullptr, nullptr);
+    if (!window) {
+        glfwTerminate();
+        return 1;
+    }
+
+    // Override-redirect: the window manager leaves the window alone, so it stays
+    // on top, never takes focus and goes exactly where it is put.
+    Display* display = glfwGetX11Display();
+    const Window overlayWindow = glfwGetX11Window(window);
+    XSetWindowAttributes attributes{};
+    attributes.override_redirect = True;
+    x11.changeWindowAttributes(display, overlayWindow, CWOverrideRedirect, &attributes);
+
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0);
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui_ImplGlfw_InitForOpenGL(window, false);   // the overlay takes no input
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+#else
+    ImGui_ImplOpenGL3_Init("#version 130");
+#endif
+    const UiFonts fonts = loadFonts();
+
+    std::thread(watchX11Hotkey, &x11).detach();
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
+
+    OverlayNumbers numbers;
+    Skin skin = Skin::Jarv;
+    const auto useSkin = [&](Skin newSkin) {
+        skin = newSkin;
+        applySkin(skin, fonts);   // the Classic look takes its colours and spacing from ImGui's style
+    };
+    useSkin(Skin::Jarv);
+
+    // The window is fitted to the panel after every frame, so nothing but the
+    // panel is ever on screen. Without a compositor (some X11 desktops, or KDE's
+    // X11 session while a fullscreen game turns compositing off), the see-through
+    // parts of a window show up black.
+    int windowWidth = 240, windowHeight = 90;
+    const auto drawFrame = [&] {
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        ImDrawList* draw = ImGui::GetBackgroundDrawList();
+        ImVec2 panel;
+        switch (skin) {
+            case Skin::Classic:   panel = drawClassicOverlay(draw, numbers, fonts);   break;
+            case Skin::Jarv:      panel = drawJarvOverlay(draw, numbers, fonts);      break;
+            case Skin::Galactic:  panel = drawGalacticOverlay(draw, numbers, fonts);  break;
+            case Skin::Gunship:   panel = drawGunshipOverlay(draw, numbers, fonts);   break;
+            case Skin::Halloween: panel = drawHalloweenOverlay(draw, numbers, fonts); break;
+        }
+        ImGui::Render();
+
+        int framebufferWidth, framebufferHeight;
+        glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
+        glViewport(0, 0, framebufferWidth, framebufferHeight);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+
+        const int width = static_cast<int>(std::ceil(panel.x)), height = static_cast<int>(std::ceil(panel.y));
+        if (width != windowWidth || height != windowHeight) {
+            windowWidth = width;
+            windowHeight = height;
+            glfwSetWindowSize(window, width, height);
+        }
+    };
+
+    // What the overlay was opened on:
+    //   Window: the focused app ("Limit Overlay to Focused App" on). It shows only
+    //           while that app has focus, and closes for good when the app does.
+    //           Only X11 apps can be followed (Proton/Wine games are X11).
+    //   Screen: the main screen's corner (the setting off). It stays there,
+    //           whatever has focus, until the hotkey closes it.
+    enum class OpenedOn { Nothing, Window, Screen };
+    OpenedOn openedOn = OpenedOn::Nothing;
+    Window target = None;
+    bool mapped = false;   // actually on screen right now
+
+    const auto report = [](bool active) {
+        if (write(STDOUT_FILENO, active ? "active 1\n" : "active 0\n", 9) < 0) {
+            // the main process is gone; reading stdin will notice and end the loop
+        }
+    };
+    const auto showAt = [&](ImVec2 corner) {
+        x11.moveWindow(display, overlayWindow, static_cast<int>(corner.x + kOverlayMargin),
+                       static_cast<int>(corner.y + kOverlayMargin));
+        if (!mapped) drawFrame();   // the first frame fits the window to the panel before it appears
+        drawFrame();
+        if (!mapped) {
+            glfwShowWindow(window);
+            mapped = true;
+        }
+    };
+    const auto hideFromScreen = [&] {
+        if (!mapped) return;
+        glfwHideWindow(window);
+        mapped = false;
+    };
+    const auto closeOverlay = [&] {
+        openedOn = OpenedOn::Nothing;
+        target = None;
+        hideFromScreen();
+        report(false);
+    };
+    // The hotkey closes the overlay if it's on screen. Otherwise (closed, or
+    // hidden because its app isn't focused) it opens it: on the focused app when
+    // `limitToApp`, else in the screen's corner. With `limitToApp` and no app it
+    // can follow in focus (a Wayland window, say), the press does nothing.
+    const auto toggle = [&](bool limitToApp) {
+        if (mapped) {
+            closeOverlay();
+            return;
+        }
+        if (!limitToApp) {
+            target = None;
+            openedOn = OpenedOn::Screen;
+        } else {
+            const Window focused = focusedX11Window(x11, display, overlayWindow);
+            if (focused == None) return;
+            target = focused;
+            openedOn = OpenedOn::Window;
+        }
+        report(true);
+    };
+
+    std::string input;
+    while (true) {
+        // While open, wake 4 times a second to follow (or notice the end of) its window.
+        pollfd waitForInput{STDIN_FILENO, POLLIN, 0};
+        poll(&waitForInput, 1, openedOn != OpenedOn::Nothing ? 250 : -1);
+
+        char chunk[512];
+        ssize_t bytes;
+        while ((bytes = read(STDIN_FILENO, chunk, sizeof(chunk))) > 0) input.append(chunk, static_cast<size_t>(bytes));
+        if (bytes == 0) break;   // the main process has closed
+        size_t newline;
+        while ((newline = input.find('\n')) != std::string::npos) {
+            const std::string line = input.substr(0, newline);
+            input.erase(0, newline + 1);
+            if (line == "toggle app")         toggle(true);
+            else if (line == "toggle screen") toggle(false);
+            else if (startsWith(line, "skin ")) {
+                for (const SkinChoice& choice : kSkinChoices) {
+                    if (line.substr(strlen("skin ")) == choice.id) useSkin(choice.skin);
+                }
+            } else {
+                parseOverlayStatsLine(line, numbers);
+            }
+        }
+        glfwPollEvents();
+
+        if (openedOn == OpenedOn::Screen) {
+            showAt(screenCorner(x11, display));
+        } else if (openedOn == OpenedOn::Window) {
+            const std::optional<ImVec2> corner = windowCorner(x11, display, target);
+            if (!corner) {
+                closeOverlay();     // its app has closed
+            } else if (focusedX11Window(x11, display, overlayWindow) == target) {
+                showAt(*corner);
+            } else {
+                hideFromScreen();   // until its app is focused again
+            }
+        }
+    }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwTerminate();
+    return 0;
+}
+
+// The overlay process, seen from the main program.
+class OverlayProcess {
+public:
+    OverlayProcess() = default;
+    OverlayProcess(const OverlayProcess&) = delete;
+    OverlayProcess& operator=(const OverlayProcess&) = delete;
+    ~OverlayProcess() { stop(); }
+
+    bool active() const { return g_overlayActive; }
+
+    // Starts `CpuMonitor --overlay`, if there is an X11 display (XWayland
+    // counts) to show it on.
+    void start() {
+        const char* x11Display = getenv("DISPLAY");
+        if (!x11Display || !*x11Display) return;
+
+        int toOverlay[2], fromOverlay[2];
+        if (pipe2(toOverlay, O_CLOEXEC) != 0) return;
+        if (pipe2(fromOverlay, O_CLOEXEC) != 0) {
+            close(toOverlay[0]);
+            close(toOverlay[1]);
+            return;
+        }
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, toOverlay[0], STDIN_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, fromOverlay[1], STDOUT_FILENO);
+        const char* const args[] = {"CpuMonitor", "--overlay", nullptr};
+        const int result = posix_spawn(&pid_, "/proc/self/exe", &actions, nullptr, const_cast<char* const*>(args), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(toOverlay[0]);
+        close(fromOverlay[1]);
+        if (result != 0) {
+            close(toOverlay[1]);
+            close(fromOverlay[0]);
+            pid_ = -1;
+            return;
+        }
+        fd_ = toOverlay[1];
+        fcntl(fd_, F_SETFL, O_NONBLOCK);   // a stuck overlay must never freeze the main window
+        std::thread(readReports, fromOverlay[0]).detach();
+    }
+
+    // The hotkey was pressed. `stats` is sent first so the overlay never opens
+    // with old numbers. `limitToApp` is the "Limit Overlay to Focused App" setting.
+    void toggle(const LiveStats& stats, bool limitToApp) {
+        // Both hotkey sources can report the same press (X11 sessions where the
+        // desktop also has the shortcut), so presses this close together count once.
+        constexpr double kTogglePause = 0.3;
+        const double now = glfwGetTime();
+        if (now - lastToggle_ < kTogglePause) return;
+        lastToggle_ = now;
+
+        sendStats(stats);
+        send(limitToApp ? "toggle app\n" : "toggle screen\n");
+    }
+
+    void sendStats(const LiveStats& stats) { send(overlayStatsLine(stats)); }
+
+    // The overlay draws itself in the same skin as the main window.
+    void setSkin(Skin skin) { send(std::string("skin ") + skinChoice(skin).id + "\n"); }
+
+private:
+    // Passes the overlay's reports on to the main loop: "hotkey" (from its X11
+    // key grab) and "active 1/0". Ends when the overlay process does.
+    static void readReports(int fd) {
+        std::string line;
+        char c;
+        while (read(fd, &c, 1) == 1) {
+            if (c != '\n') {
+                line += c;
+                continue;
+            }
+            if (line == "hotkey") {
+                postRequest(kRequestToggleOverlay);
+            } else if (line == "active 1" || line == "active 0") {
+                g_overlayActive = (line == "active 1");
+                postRequest(kRequestOverlayChanged);
+            }
+            line.clear();
+        }
+        g_overlayActive = false;
+        close(fd);
+    }
+
+    // Sends one line. If the overlay has gone away, it simply stays gone.
+    void send(const std::string& line) {
+        if (fd_ >= 0 && write(fd_, line.data(), line.size()) < 0 && errno != EAGAIN) stop();
+    }
+
+    void stop() {
+        if (fd_ >= 0) {
+            close(fd_);   // the overlay sees the pipe close and quits
+            fd_ = -1;
+        }
+        if (pid_ > 0) {
+            kill(pid_, SIGTERM);
+            waitpid(pid_, nullptr, 0);
+            pid_ = -1;
+        }
+    }
+
+    pid_t pid_{-1};
+    int fd_{-1};
+    double lastToggle_{-1.0};
+};
+
+// ---- Hotkey through the desktop's GlobalShortcuts portal ----------------------
+
+// The GLib functions used to talk to the portal over D-Bus.
+struct GioApi {
+    decltype(&g_bus_get_sync) busGetSync{};
+    decltype(&g_dbus_connection_get_unique_name) uniqueName{};
+    decltype(&g_dbus_connection_call_sync) callSync{};
+    decltype(&g_dbus_connection_signal_subscribe) signalSubscribe{};
+    decltype(&g_dbus_connection_signal_unsubscribe) signalUnsubscribe{};
+    decltype(&g_variant_new_parsed) newParsed{};
+    decltype(&g_variant_get) get{};
+    decltype(&g_variant_lookup) lookup{};
+    decltype(&g_variant_lookup_value) lookupValue{};
+    decltype(&g_variant_n_children) childCount{};
+    decltype(&g_variant_unref) unref{};
+    decltype(&g_main_context_new) newContext{};
+    decltype(&g_main_context_push_thread_default) pushContext{};
+    decltype(&g_main_loop_new) newLoop{};
+    decltype(&g_main_loop_run) runLoop{};
+    decltype(&g_main_loop_quit) quitLoop{};
+    decltype(&g_error_free) freeError{};
+
+    bool load() {
+        void* library = dlopen("libgio-2.0.so.0", RTLD_NOW | RTLD_LOCAL);   // brings GLib along
+        return library && loadSymbol(library, "g_bus_get_sync", busGetSync) &&
+               loadSymbol(library, "g_dbus_connection_get_unique_name", uniqueName) &&
+               loadSymbol(library, "g_dbus_connection_call_sync", callSync) &&
+               loadSymbol(library, "g_dbus_connection_signal_subscribe", signalSubscribe) &&
+               loadSymbol(library, "g_dbus_connection_signal_unsubscribe", signalUnsubscribe) &&
+               loadSymbol(library, "g_variant_new_parsed", newParsed) && loadSymbol(library, "g_variant_get", get) &&
+               loadSymbol(library, "g_variant_lookup", lookup) && loadSymbol(library, "g_variant_lookup_value", lookupValue) &&
+               loadSymbol(library, "g_variant_n_children", childCount) && loadSymbol(library, "g_variant_unref", unref) &&
+               loadSymbol(library, "g_main_context_new", newContext) &&
+               loadSymbol(library, "g_main_context_push_thread_default", pushContext) &&
+               loadSymbol(library, "g_main_loop_new", newLoop) && loadSymbol(library, "g_main_loop_run", runLoop) &&
+               loadSymbol(library, "g_main_loop_quit", quitLoop) && loadSymbol(library, "g_error_free", freeError);
+    }
+};
+
+constexpr const char* kPortalBusName = "org.freedesktop.portal.Desktop";
+constexpr const char* kPortalPath = "/org/freedesktop/portal/desktop";
+constexpr const char* kShortcutsInterface = "org.freedesktop.portal.GlobalShortcuts";
+
+// Remembers that the user said no to the shortcut, so they aren't asked at every launch.
+std::string hotkeyDeclinedMarkerPath() {
+    const std::string settingsPath = settingsFilePath();
+    return settingsPath.empty() ? "" : fs::path(settingsPath).parent_path().string() + "/hotkey-declined";
+}
+
+class ShortcutsPortal {
+public:
+    // Registers Ctrl+Shift+O with the desktop, then posts kRequestToggleOverlay
+    // every time it is pressed. Never returns unless the portal is unavailable,
+    // so it runs on a thread of its own.
+    void run() {
+        if (!gio_.load()) return;
+        GMainContext* context = gio_.newContext();
+        gio_.pushContext(context);   // portal answers are delivered to this thread
+        loop_ = gio_.newLoop(context, FALSE);
+
+        GError* error = nullptr;
+        bus_ = gio_.busGetSync(G_BUS_TYPE_SESSION, nullptr, &error);
+        if (!bus_) {
+            gio_.freeError(error);
+            return;
+        }
+        // Request objects are named after our D-Bus name: ":1.42" -> "1_42".
+        sender_ = gio_.uniqueName(bus_) + 1;
+        std::replace(sender_.begin(), sender_.end(), '.', '_');
+
+        // The portal identifies Flatpak and Snap apps by themselves; anything
+        // else has to say who it is (matching veeastats.desktop) before its first
+        // call. Older portals don't have this and don't need it.
+        if (GVariant* reply = call("org.freedesktop.host.portal.Registry", "Register",
+                                   gio_.newParsed("('veeastats', @a{sv} {})"))) {
+            gio_.unref(reply);
+        }
+
+        std::string token = nextToken();
+        GVariant* results = request("CreateSession", gio_.newParsed("({'handle_token': <%s>, 'session_handle_token': <%s>},)",
+                                                                    token.c_str(), "veeastats"), token);
+        if (!results) return;   // no GlobalShortcuts portal on this desktop
+        const char* sessionHandle = nullptr;
+        gio_.lookup(results, "session_handle", "&s", &sessionHandle);
+        session_ = sessionHandle ? sessionHandle : "";
+        gio_.unref(results);
+        if (session_.empty()) return;
+
+        if (!alreadyBound(session_) && !bind(session_)) return;
+
+        // Activated's first argument is our session, but as an object path, and
+        // D-Bus "arg0" filters only match plain strings. So it's checked here.
+        gio_.signalSubscribe(
+            bus_, kPortalBusName, kShortcutsInterface, "Activated", kPortalPath, nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
+            [](GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*, GVariant* parameters, gpointer data) {
+                ShortcutsPortal& portal = *static_cast<ShortcutsPortal*>(data);
+                const gchar* session = nullptr;
+                const gchar* shortcut = nullptr;
+                guint64 timestamp = 0;
+                GVariant* options = nullptr;
+                portal.gio_.get(parameters, "(&o&st@a{sv})", &session, &shortcut, &timestamp, &options);
+                if (session == portal.session_ && strcmp(shortcut, "toggle-overlay") == 0) postRequest(kRequestToggleOverlay);
+                portal.gio_.unref(options);
+            },
+            this, nullptr);
+        gio_.runLoop(loop_);
+    }
+
+private:
+    GVariant* call(const char* interface, const char* method, GVariant* parameters) {
+        GError* error = nullptr;
+        GVariant* reply = gio_.callSync(bus_, kPortalBusName, kPortalPath, interface, method, parameters, nullptr,
+                                        G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
+        if (!reply) gio_.freeError(error);
+        return reply;
+    }
+
+    std::string nextToken() { return "veeastats" + std::to_string(++tokenCount_); }
+
+    // Portal methods answer later, through a "Response" signal on a Request
+    // object named after `token`. Calls `method` and waits for that answer.
+    // Returns its results (unref them when done), or nullptr if the call failed
+    // or the user said no.
+    GVariant* request(const char* method, GVariant* parameters, const std::string& token) {
+        struct Answer {
+            GioApi* gio;
+            GMainLoop* loop;
+            guint32 code{2};
+            GVariant* results{nullptr};
+        } answer{&gio_, loop_};
+
+        const std::string path = std::string(kPortalPath) + "/request/" + sender_ + "/" + token;
+        const guint subscription = gio_.signalSubscribe(
+            bus_, kPortalBusName, "org.freedesktop.portal.Request", "Response", path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
+            [](GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*, GVariant* parameters, gpointer data) {
+                Answer& answer = *static_cast<Answer*>(data);
+                answer.gio->get(parameters, "(u@a{sv})", &answer.code, &answer.results);
+                answer.gio->quitLoop(answer.loop);
+            },
+            &answer, nullptr);
+
+        if (GVariant* reply = call(kShortcutsInterface, method, parameters)) {
+            gio_.unref(reply);
+            gio_.runLoop(loop_);   // until the Response arrives (for BindShortcuts, until the user answers)
+        }
+        gio_.signalUnsubscribe(bus_, subscription);
+
+        if (answer.code != 0 && answer.results) {
+            gio_.unref(answer.results);
+            answer.results = nullptr;
+        }
+        return answer.results;
+    }
+
+    // True if the desktop already has our shortcut from an earlier run.
+    bool alreadyBound(const std::string& session) {
+        const std::string token = nextToken();
+        GVariant* results = request("ListShortcuts", gio_.newParsed("(%o, {'handle_token': <%s>})", session.c_str(), token.c_str()), token);
+        if (!results) return false;
+        GVariant* shortcuts = gio_.lookupValue(results, "shortcuts", nullptr);
+        const bool bound = shortcuts && gio_.childCount(shortcuts) > 0;
+        if (shortcuts) gio_.unref(shortcuts);
+        gio_.unref(results);
+        return bound;
+    }
+
+    // Asks the desktop for Ctrl+Shift+O. The desktop shows the user a
+    // confirmation (where they may also pick a different key).
+    bool bind(const std::string& session) {
+        const std::string declinedMarker = hotkeyDeclinedMarkerPath();
+        if (declinedMarker.empty() || fileExists(declinedMarker)) return false;
+
+        const std::string token = nextToken();
+        GVariant* results = request(
+            "BindShortcuts",
+            gio_.newParsed("(%o, [('toggle-overlay', {'description': <'Show or hide the VeeaStats overlay'>, "
+                           "'preferred_trigger': <'CTRL+SHIFT+o'>})], '', {'handle_token': <%s>})",
+                           session.c_str(), token.c_str()),
+            token);
+        if (!results) {
+            std::error_code ignored;
+            fs::create_directories(fs::path(declinedMarker).parent_path(), ignored);
+            if (FILE* file = fopen(declinedMarker.c_str(), "w")) fclose(file);
+            return false;
+        }
+        gio_.unref(results);
+        return true;
+    }
+
+    GioApi gio_;
+    GDBusConnection* bus_{nullptr};
+    GMainLoop* loop_{nullptr};
+    std::string sender_;
+    std::string session_;
+    int tokenCount_{0};
+};
+
+void runShortcutsPortal() {
+    ShortcutsPortal portal;
+    portal.run();
+}
+
+// ---- One copy at a time ------------------------------------------------------
+//
+// Opening VeeaStats while it is already running (for example from the app menu
+// while it runs in the background) shows the running copy's window instead of
+// starting a second one. If the running copy is a different build, because the
+// user opened a newer AppImage, the old copy quits and the new one takes over.
+// The copies talk through a Unix socket with an abstract name (no file on disk).
+
+const std::string kBuildId = __DATE__ " " __TIME__;
+
+sockaddr_un instanceSocketAddress(socklen_t& length) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::string name = "veeastats-" + std::to_string(getuid());   // one per user
+    memcpy(address.sun_path + 1, name.data(), name.size());              // leading '\0' = abstract
+    length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name.size());
+    return address;
+}
+
+// Reads one line (up to `timeoutMs`), without the newline.
+std::string readSocketLine(int fd, int timeoutMs) {
+    std::string line;
+    char c;
+    pollfd waitForData{fd, POLLIN, 0};
+    while (poll(&waitForData, 1, timeoutMs) > 0 && read(fd, &c, 1) == 1 && c != '\n') line += c;
+    return line;
+}
+
+// Sends `message` to the running copy and returns its reply ("" if none is running).
+std::string messageRunningCopy(const std::string& message) {
+    socklen_t length;
+    const sockaddr_un address = instanceSocketAddress(length);
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return "";
+    std::string reply;
+    if (connect(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0) {
+        const std::string line = message + "\n";
+        if (write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size())) reply = readSocketLine(fd, 2000);
+    }
+    close(fd);
+    return reply;
+}
+
+// Returns a listening socket if this is now the only copy, or -1. Sets
+// `handedOver` when a running copy is showing its window instead, in which case
+// this copy should just exit.
+int claimOnlyCopy(bool& handedOver) {
+    socklen_t length;
+    const sockaddr_un address = instanceSocketAddress(length);
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return -1;
+        if (bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0 && listen(fd, 4) == 0) return fd;
+        close(fd);
+
+        if (messageRunningCopy("show " + kBuildId) == "ok") {
+            handedOver = true;
+            return -1;
+        }
+        usleep(100 * 1000);   // the old copy is quitting (or just did); try again shortly
+    }
+    return -1;   // couldn't sort it out: run anyway
+}
+
+// Answers other copies: "show <build>" and "quit". Runs on a thread of its own.
+void listenForOtherCopies(int listenFd) {
+    while (true) {
+        const int client = accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        const std::string message = readSocketLine(client, 1000);
+        std::string reply;
+        if (message == "show " + kBuildId) {
+            reply = "ok\n";
+            postRequest(kRequestShowWindow);
+        } else if (startsWith(message, "show ")) {   // a different build: make way for it
+            reply = "replacing\n";
+            postRequest(kRequestQuit);
+        } else if (message == "quit") {
+            reply = "ok\n";
+            postRequest(kRequestQuit);
+        }
+        if (!reply.empty() && write(client, reply.data(), reply.size()) < 0) {
+            // the other copy gave up waiting; nothing to do
+        }
+        close(client);
+    }
+}
+
+}  // namespace
+
+// ============================================================================
+// 9. MAIN
+// ============================================================================
+
+int main(int argc, char** argv) {
+    const std::string mode = (argc > 1) ? argv[1] : "";
+    if (mode == "--overlay") return runOverlayProcess();
+    if (mode == "--quit") {   // used by the uninstaller
+        messageRunningCopy("quit");
+        return 0;
+    }
+
+    bool handedOver = false;
+    const int instanceSocket = claimOnlyCopy(handedOver);
+    if (handedOver) return 0;   // VeeaStats was already running and is showing its window instead
+    signal(SIGPIPE, SIG_IGN);   // writing to an overlay that has quit must not end the program
+
+    glfwSetErrorCallback(onGlfwError);
+    if (!glfwInit()) return 1;
+
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+    const char* glslVersion = "#version 300 es";
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+#else
+    const char* glslVersion = "#version 130";
+#endif
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+
+    // Lets the desktop match the window to veeastats.desktop (taskbar icon/name).
+#if defined(GLFW_WAYLAND_APP_ID)
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "veeastats");
+#endif
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "veeastats");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "veeastats");
+
+    // Preferred window size, shrunk to fit small screens such as handhelds.
+    int width = 920, height = 720;
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    if (const GLFWvidmode* mode = monitor ? glfwGetVideoMode(monitor) : nullptr) {
+        width  = std::min(width, mode->width);
+        height = std::min(height, mode->height);
+    }
+
+    GLFWwindow* window = glfwCreateWindow(width, height, "VeeaStats", nullptr, nullptr);
+    if (!window) {
+        glfwTerminate();
+        return 1;
+    }
+    glfwMakeContextCurrent(window);
+    // No vsync: the main loop paces its own frames. With vsync, a window that is
+    // fully covered (by a fullscreen game, say) gets stuck waiting for a screen
+    // refresh the desktop never sends it, and stops updating the overlay.
+    glfwSwapInterval(0);
+
+    bool inputArrived = false;   // set by the callbacks whenever the user does something
+    watchForInput(window, &inputArrived);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;   // don't write imgui.ini to disk
+    io.LogFilename = nullptr;
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init(glslVersion);
+
+    const UiFonts fonts = loadFonts();
+    UiState ui;                                   // changed by the controls in the window
+    ui.settings = loadSettings();
+    applySkin(ui.settings.skin, fonts);
+    Settings appliedSettings = ui.settings;       // what the window currently looks like
+    const HudSkins hudSkins = makeHudSkins(fonts);
+    HudState hud;
+
+    const StaticInfo staticInfo = readStaticInfo();
+    LiveMonitor monitorLive;
+    monitorLive.setRefreshIntervalMs(ui.settings.refreshMs);   // the saved interval
+    double lastRefresh = glfwGetTime();
+    int framesToDraw = 2;                         // frames to draw back-to-back before sleeping (see below)
+
+    if (instanceSocket >= 0) std::thread(listenForOtherCopies, instanceSocket).detach();
+    // On X11 sessions the overlay's own key grab already works in every program.
+    if (getenv("WAYLAND_DISPLAY")) std::thread(runShortcutsPortal).detach();
+    OverlayProcess overlay;
+    overlay.start();
+    overlay.setSkin(ui.settings.skin);
+    bool windowHidden = false;                    // closed while running in the background
+
+    while (true) {
+        const unsigned requests = g_requests.exchange(0);
+        if (requests & kRequestQuit) break;
+        if (requests & kRequestShowWindow) {      // VeeaStats was opened again
+            if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) glfwRestoreWindow(window);
+            glfwShowWindow(window);
+            glfwFocusWindow(window);
+            windowHidden = false;
+            framesToDraw = 2;
+        }
+        if (requests & kRequestToggleOverlay) {
+            monitorLive.refresh();                // fresh numbers in case it's opening
+            lastRefresh = glfwGetTime();
+            overlay.toggle(monitorLive.stats(), ui.settings.limitOverlayToApp);
+        }
+
+        if (ui.quitRequested) break;
+        if (glfwWindowShouldClose(window)) {
+            if (!ui.settings.runInBackground) break;
+            glfwSetWindowShouldClose(window, GLFW_FALSE);   // in the background, closing only hides the window
+            glfwHideWindow(window);
+            windowHidden = true;
+            ui.settingsOpen = false;
+        }
+
+        // Stats are only read while someone can see them: in the window, or in the overlay.
+        const bool drawing = !windowHidden && !glfwGetWindowAttrib(window, GLFW_ICONIFIED);
+        const double frameStart = glfwGetTime();
+        if ((drawing || overlay.active()) && frameStart - lastRefresh >= ui.settings.refreshMs / 1000.0) {
+            monitorLive.refresh();
+            lastRefresh = glfwGetTime();
+            if (overlay.active()) overlay.sendStats(monitorLive.stats());
+        }
+
+        if (drawing) {
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+            drawWindow(io.DisplaySize, ui, hudSkins, hud, staticInfo, monitorLive.stats());
+            ImGui::Render();
+
+            if (ui.settings != appliedSettings) {     // the user changed something in the settings menu
+                if (ui.settings.skin != appliedSettings.skin) {
+                    applySkin(ui.settings.skin, fonts);
+                    overlay.setSkin(ui.settings.skin);
+                    framesToDraw = 2;                 // lay the new skin out straight away
+                }
+                if (ui.settings.refreshMs != appliedSettings.refreshMs) monitorLive.setRefreshIntervalMs(ui.settings.refreshMs);
+                saveSettings(ui.settings);
+                appliedSettings = ui.settings;
+            }
+
+            int framebufferWidth, framebufferHeight;
+            glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
+            glViewport(0, 0, framebufferWidth, framebufferHeight);
+            glClearColor(0.1f, 0.105f, 0.11f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(window);
+        }
+
+        // Sleep until the next refresh is due or the user interacts with the
+        // window (mouse, keyboard, resize...). Nothing changes in between, so
+        // there is no reason to redraw 60 times a second.
+        //
+        // After the very first frame, and after every user action, two frames are
+        // drawn back-to-back: ImGui needs a second pass to finish laying out
+        // tables and to show a freshly opened dropdown.
+        //
+        // Animated skins are the exception: they redraw at a steady 30 fps
+        // (still only a sliver of one CPU core).
+        //
+        // With the window minimized or hidden, only the overlay (if showing)
+        // needs waking for; otherwise sleep until something happens.
+        const double untilRefresh = std::max(ui.settings.refreshMs / 1000.0 - (glfwGetTime() - lastRefresh), 0.0);
+        double timeout = -1.0;                        // no timeout
+        if (drawing) {
+            if (framesToDraw > 0) --framesToDraw;
+            timeout = (framesToDraw > 0) ? 0.0 : untilRefresh;
+            if (ui.settings.skin != Skin::Classic && ui.settings.animations) {
+                timeout = std::min(timeout, std::max(frameStart + kAnimationFrameSeconds - glfwGetTime(), 0.0));
+            }
+        } else if (overlay.active()) {
+            timeout = untilRefresh;
+        }
+
+        // Sleep until the timeout, but wake straight away for user input or a
+        // request from another thread. Any other wake-up just goes back to sleep
+        // for the time that's left.
+        inputArrived = false;
+        const double deadline = glfwGetTime() + timeout;
+        const auto keepSleeping = [&] {
+            return !inputArrived && g_requests == 0 && !glfwWindowShouldClose(window) &&
+                   (timeout < 0.0 || glfwGetTime() < deadline);
+        };
+        if (timeout < 0.0) glfwWaitEvents();
+        else               glfwWaitEventsTimeout(timeout);
+        while (keepSleeping()) {
+            if (timeout < 0.0) glfwWaitEvents();
+            else               glfwWaitEventsTimeout(deadline - glfwGetTime());
+        }
+        if (inputArrived) framesToDraw = 2;
+    }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}

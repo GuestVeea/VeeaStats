@@ -70,8 +70,18 @@ target_link_libraries(CpuMonitor PRIVATE
 )
 
 # Bundle libstdc++/libgcc into the binary so it doesn't depend on the build
-# machine's (possibly newer) C++ runtime.
-target_link_options(CpuMonitor PRIVATE -static-libstdc++ -static-libgcc)
+# machine's (possibly newer) C++ runtime. That matters for the release AppImage,
+# which packaging/build-appimage.sh checks; a build for your own PC works either
+# way, so it's skipped where the static library isn't installed (for example
+# Fedora, unless libstdc++-static is).
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LINK_OPTIONS -static-libstdc++ -static-libgcc)
+check_cxx_source_compiles("#include <string>
+int main() { return static_cast<int>(std::string(\"x\").size()) - 1; }" VEEASTATS_STATIC_LIBSTDCXX)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+if(VEEASTATS_STATIC_LIBSTDCXX)
+    target_link_options(CpuMonitor PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 install(TARGETS CpuMonitor RUNTIME DESTINATION bin)
 install(FILES packaging/veeastats.desktop DESTINATION share/applications)

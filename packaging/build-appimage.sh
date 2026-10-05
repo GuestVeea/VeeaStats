@@ -45,6 +45,13 @@ DIST_DIR="$PROJECT_DIR/dist"
 
 cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build "$BUILD_DIR" -j"$(nproc)"
+
+# The release binary must carry its own C++ runtime (CMakeLists.txt links it
+# in when it can), or it would depend on each user's libstdc++ version.
+if objdump -p "$BUILD_DIR/CpuMonitor" | grep -q 'NEEDED.*libstdc++'; then
+    echo "error: CpuMonitor links libstdc++ dynamically; install the static libstdc++ (libstdc++-static / libstdc++-dev)" >&2
+    exit 1
+fi
 rm -rf "$APPDIR"
 DESTDIR="$APPDIR" cmake --install "$BUILD_DIR"
 

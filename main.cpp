@@ -2547,6 +2547,1164 @@ void applyJarvStyle(ImGuiStyle& style) {
     colors[ImGuiCol_NavCursor]            = kJarvCyan;
 }
 
+// ---- Galactic Conflict --------------------------------------------------------
+// A starship tactical display: thin electric-blue line work on black, rings of
+// fine tick marks, bar graphs on a grid, and notched panels with gold titles,
+// like a capital ship's targeting screens and a space-war game's main menu.
+
+const ImVec4 kGcBlue  (0.30f, 0.40f, 1.00f, 1.0f);      // line work
+const ImVec4 kGcSky   (0.58f, 0.67f, 1.00f, 1.0f);      // labels
+const ImVec4 kGcWhite (0.92f, 0.94f, 1.00f, 1.0f);      // values
+const ImVec4 kGcGold  (1.00f, 0.80f, 0.20f, 1.0f);      // titles; busy
+const ImVec4 kGcRed   (1.00f, 0.20f, 0.25f, 1.0f);      // markers; critical
+const ImVec4 kGcPanel (0.03f, 0.05f, 0.17f, 1.0f);      // panel fill
+const ImVec4 kGcBlack (0.006f, 0.008f, 0.022f, 1.0f);   // window background
+
+// Blue when relaxed, gold when busy, red when critical.
+const ImVec4& galacticLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kGcRed : (fraction > warnAt) ? kGcGold : kGcBlue;
+}
+
+// A repeatable "random" number in 0..1 for decoration that must not flicker.
+float hash01(int n) {
+    unsigned x = static_cast<unsigned>(n) * 2654435761u;
+    x ^= x >> 15;
+    x *= 2246822519u;
+    x ^= x >> 13;
+    return static_cast<float>(x & 0xffffu) / 65535.0f;
+}
+
+// Black, a fine blue grid, faint perspective lines running in from the corners
+// (like a hologram's frame), and columns of short dashes down both edges that
+// read like streaming data in an alien script.
+void drawGalacticBackground(const ImVec2& size, const HudState& state) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), size, withAlpha(kGcBlack, 1.0f));
+
+    constexpr float kGridStep = 40.0f;
+    const ImU32 grid = withAlpha(kGcBlue, 0.06f);
+    for (float x = kGridStep; x < size.x; x += kGridStep) draw->AddLine(ImVec2(x, 0.0f), ImVec2(x, size.y), grid);
+    for (float y = kGridStep; y < size.y; y += kGridStep) draw->AddLine(ImVec2(0.0f, y), ImVec2(size.x, y), grid);
+
+    const ImVec2 center = size * 0.5f;
+    for (const ImVec2& corner : {ImVec2(0, 0), ImVec2(size.x, 0), size, ImVec2(0, size.y)}) {
+        draw->AddLine(corner, corner + (center - corner) * 0.45f, withAlpha(kGcBlue, 0.10f));
+    }
+
+    // The dashes drift slowly upwards while animating.
+    constexpr float kRowStep = 7.0f;
+    const int scroll = static_cast<int>(state.time * 4.0f);
+    for (float y = 50.0f; y < size.y - 10.0f; y += kRowStep) {
+        const int row = static_cast<int>(y / kRowStep) + scroll;
+        const float leftLength = 2.0f + std::floor(hash01(row) * 7.0f);
+        const float rightLength = 2.0f + std::floor(hash01(row + 9973) * 7.0f);
+        draw->AddRectFilled(ImVec2(3.0f, y), ImVec2(3.0f + leftLength, y + 2.0f), withAlpha(kGcSky, 0.22f));
+        draw->AddRectFilled(ImVec2(size.x - 3.0f - rightLength, y), ImVec2(size.x - 3.0f, y + 2.0f), withAlpha(kGcSky, 0.22f));
+    }
+}
+
+// The six corners of a notched rectangle: top-left and bottom-right cut off by `notch`.
+std::array<ImVec2, 6> notchedCorners(const Box& box, float notch) {
+    return {{ImVec2(box.min.x + notch, box.min.y), ImVec2(box.max.x, box.min.y), ImVec2(box.max.x, box.max.y - notch),
+             ImVec2(box.max.x - notch, box.max.y), ImVec2(box.min.x, box.max.y), ImVec2(box.min.x, box.min.y + notch)}};
+}
+
+// A notched panel with a header band carrying the title in gold, like the
+// buttons of a game menu. Returns the area for content.
+Box drawGalacticPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    constexpr float kNotch = 12.0f, kHeader = 24.0f;
+    const std::array<ImVec2, 6> outline = notchedCorners(box, kNotch);
+    draw->AddConvexPolyFilled(outline.data(), static_cast<int>(outline.size()), withAlpha(kGcPanel, 0.72f));
+
+    const ImVec2 band[] = {outline[0], outline[1], ImVec2(box.max.x, box.min.y + kHeader), ImVec2(box.min.x, box.min.y + kHeader),
+                           outline[5]};
+    draw->AddConvexPolyFilled(band, 5, withAlpha(kGcBlue, 0.16f));
+    draw->AddLine(ImVec2(box.min.x, box.min.y + kHeader), ImVec2(box.max.x, box.min.y + kHeader), withAlpha(kGcBlue, 0.45f));
+    draw->AddPolyline(outline.data(), static_cast<int>(outline.size()), withAlpha(kGcBlue, 0.70f), ImDrawFlags_Closed, 1.0f);
+
+    // End caps on both sides of the header, a red marker and the gold title.
+    for (const float x : {box.min.x - 2.0f, box.max.x - 1.0f}) {
+        draw->AddRectFilled(ImVec2(x, box.min.y + kHeader - 7.0f), ImVec2(x + 3.0f, box.min.y + kHeader + 7.0f), withAlpha(kGcSky, 0.9f));
+    }
+    constexpr float kTitleSize = 10.0f;
+    const ImVec2 titleExtent = textSize(state.displayFont, kTitleSize, title);
+    const float midY = std::floor(box.min.y + (kHeader - titleExtent.y) * 0.5f);
+    draw->AddRectFilled(ImVec2(box.min.x + kNotch + 2.0f, midY + titleExtent.y * 0.5f - 2.0f),
+                        ImVec2(box.min.x + kNotch + 6.0f, midY + titleExtent.y * 0.5f + 2.0f), withAlpha(kGcRed, 1.0f));
+    draw->AddText(state.displayFont, kTitleSize, ImVec2(box.min.x + kNotch + 12.0f, midY), withAlpha(kGcGold, 1.0f), title.c_str());
+
+    // Three small tick groups at the right of the header.
+    for (int group = 0; group < 3; ++group) {
+        for (int tick = 0; tick < 3; ++tick) {
+            const float x = box.max.x - 52.0f + static_cast<float>(group) * 14.0f + static_cast<float>(tick) * 3.0f;
+            draw->AddLine(ImVec2(x, box.min.y + 8.0f), ImVec2(x, box.min.y + kHeader - 8.0f), withAlpha(kGcSky, 0.45f));
+        }
+    }
+    return Box{ImVec2(box.min.x + 14.0f, box.min.y + kHeader + 8.0f), ImVec2(box.max.x - 10.0f, box.max.y - 10.0f)};
+}
+
+// "LABEL   value": a small wide label in pale blue, the value in white.
+void drawGalacticInfoRow(const HudState& state, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(state.displayFont, 9.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5.0f);   // line the small label up with the taller value
+    ImGui::TextColored(kGcSky, "%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// A targeting dial: an outer ring of fine ticks that light up to the value, a
+// segmented arc inside it, a slowly turning dashed ring, crosshairs, and the
+// number. Both rings run 300 degrees clockwise from bottom-left, leaving the
+// bottom open for the readout.
+void drawGalacticGauge(ImDrawList* draw, const ImVec2& center, float radius, const GaugeReading& reading, const HudState& state) {
+    const float percent = std::clamp(reading.percent, 0.0f, 100.0f);
+    const float fraction = reading.hasValue ? percent / 100.0f : 0.0f;
+    const ImVec4& color = galacticLoadColor(percent, reading.warnAt, reading.critAt);
+    constexpr float kStart = kPi * (0.5f + 1.0f / 6.0f), kSweep = kPi * 5.0f / 3.0f;
+
+    // Outer comb: 101 fine ticks (one per percent), lit up to the value.
+    constexpr int kTicks = 100;
+    for (int i = 0; i <= kTicks; ++i) {
+        const float angle = kStart + kSweep * static_cast<float>(i) / kTicks;
+        const bool lit = reading.hasValue && static_cast<float>(i) <= fraction * kTicks;
+        const float inner = radius * ((i % 10 == 0) ? 0.85f : 0.90f);
+        draw->AddLine(pointOnCircle(center, inner, angle), pointOnCircle(center, radius, angle),
+                      lit ? withAlpha(color, 0.95f) : withAlpha(kGcBlue, 0.22f), lit ? 1.5f : 1.0f);
+    }
+    // A red pointer just outside the ring, at the value.
+    if (reading.hasValue) {
+        const float angle = kStart + kSweep * fraction;
+        const ImVec2 tip = pointOnCircle(center, radius + 2.0f, angle);
+        draw->AddTriangleFilled(tip, pointOnCircle(center, radius + 9.0f, angle - 0.06f), pointOnCircle(center, radius + 9.0f, angle + 0.06f),
+                                withAlpha(kGcRed, 1.0f));
+    }
+
+    // Segmented arc.
+    constexpr int kSegments = 30;
+    const float arcRadius = radius * 0.73f;
+    const float thickness = std::max(radius * 0.09f, 3.0f);
+    const float lit = fraction * kSegments;
+    for (int i = 0; i < kSegments; ++i) {
+        const float from = kStart + kSweep * static_cast<float>(i) / kSegments;
+        const float to = from + kSweep / kSegments * 0.7f;
+        const float amount = std::clamp(lit - static_cast<float>(i), 0.0f, 1.0f);
+        draw->PathArcTo(center, arcRadius, from, to);
+        draw->PathStroke(amount > 0.0f ? withAlpha(color, 0.25f + 0.75f * amount) : withAlpha(kGcBlue, 0.12f), thickness);
+    }
+
+    // Turning dashed ring, a thin circle and crosshair ticks.
+    const float spin = state.time * 0.25f;
+    for (int i = 0; i < 36; ++i) {
+        const float from = spin + 2.0f * kPi * static_cast<float>(i) / 36.0f;
+        draw->PathArcTo(center, radius * 0.61f, from, from + 0.09f);
+        draw->PathStroke(withAlpha(kGcSky, 0.35f), 1.0f);
+    }
+    draw->AddCircle(center, radius * 0.54f, withAlpha(kGcBlue, 0.35f), 0, 1.0f);
+    for (int i = 0; i < 4; ++i) {
+        const float angle = kPi * 0.5f * static_cast<float>(i);
+        draw->AddLine(pointOnCircle(center, radius * 0.50f, angle), pointOnCircle(center, radius * 0.58f, angle), withAlpha(kGcSky, 0.6f));
+    }
+
+    // The number in the middle (with a small "%": Michroma's own looks like "o/o"),
+    // and the gold label under it.
+    const float numberSize = std::round(radius * 0.28f);
+    if (reading.hasValue) {
+        const std::string number = format("%.0f", percent);
+        const float signSize = std::round(numberSize * 0.75f);
+        const ImVec2 numberExtent = textSize(state.displayFont, numberSize, number);
+        const ImVec2 signExtent = textSize(state.textFont, signSize, "%");
+        const ImVec2 pos(std::floor(center.x - (numberExtent.x + signExtent.x + 3.0f) * 0.5f), std::floor(center.y - numberExtent.y * 0.62f));
+        draw->AddText(state.displayFont, numberSize, pos, withAlpha(kGcWhite, 1.0f), number.c_str());
+        draw->AddText(state.textFont, signSize, ImVec2(pos.x + numberExtent.x + 3.0f, pos.y + numberExtent.y - signExtent.y),
+                      withAlpha(kGcSky, 1.0f), "%");
+    } else {
+        drawCenteredText(draw, state.displayFont, std::round(numberSize * 0.7f), ImVec2(center.x, center.y - numberSize * 0.2f),
+                         withAlpha(kGcSky, 1.0f), "N/A");
+    }
+    drawCenteredText(draw, state.displayFont, std::max(std::round(radius * 0.10f), 8.0f), ImVec2(center.x, center.y + radius * 0.25f),
+                     withAlpha(kGcGold, 1.0f), reading.label);
+
+    // Readouts: the first sits in the arc's opening, the second just below the dial.
+    drawCenteredText(draw, state.textFont, 16.0f, ImVec2(center.x, center.y + radius * 0.82f), withAlpha(kGcWhite, 1.0f), reading.line1);
+    drawCenteredText(draw, state.textFont, 14.0f, ImVec2(center.x, center.y + radius * 0.82f + 18.0f), withAlpha(kGcSky, 1.0f), reading.line2);
+}
+
+void drawGalacticGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    const DialLayout layout = dialLayout(box);
+    for (int i = 0; i < 4; ++i) {
+        drawGalacticGauge(draw, ImVec2(layout.centerX(box, i), layout.centerY), layout.radius * 0.94f, readings[i], state);
+        if (i > 0) {   // divider: a thin line with a small diamond in the middle
+            const float x = std::floor(box.min.x + layout.columnWidth * static_cast<float>(i)) + 0.5f;
+            draw->AddLine(ImVec2(x, layout.centerY - layout.radius * 0.7f), ImVec2(x, layout.centerY + layout.radius * 0.7f),
+                          withAlpha(kGcBlue, 0.25f));
+            draw->AddQuadFilled(ImVec2(x, layout.centerY - 4.0f), ImVec2(x + 4.0f, layout.centerY), ImVec2(x, layout.centerY + 4.0f),
+                                ImVec2(x - 4.0f, layout.centerY), withAlpha(kGcSky, 0.7f));
+        }
+    }
+}
+
+// The cores as a bar graph on a grid, with a dashed red line at the busy mark.
+void drawGalacticCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawGalacticPanelFrame(draw, box, format("CORE ARRAY // %zu THREADS", state.cores.size()), state), "##GalacticCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    constexpr float kValueRow = 14.0f, kLabelRow = 14.0f;
+    const Box graph{ImVec2(start.x, start.y + kValueRow), ImVec2(start.x + room.x, start.y + std::max(room.y - kLabelRow, kValueRow + 30.0f))};
+    for (int i = 0; i <= 4; ++i) {   // 0, 25, 50, 75 and 100%
+        const float y = std::floor(graph.max.y - graph.height() * static_cast<float>(i) / 4.0f) + 0.5f;
+        panel->AddLine(ImVec2(graph.min.x, y), ImVec2(graph.max.x, y), withAlpha(kGcBlue, i == 0 ? 0.55f : 0.14f));
+    }
+
+    const int count = static_cast<int>(state.cores.size());
+    const float slot = graph.width() / static_cast<float>(std::max(count, 1));
+    const float barWidth = std::max(std::floor(slot * 0.6f), 3.0f);
+    for (int i = 0; i < count; ++i) {
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const float centerX = std::floor(graph.min.x + slot * (static_cast<float>(i) + 0.5f));
+        const float top = std::floor(graph.max.y - graph.height() * value / 100.0f);
+        const ImVec4& color = galacticLoadColor(value, 0.50f, 0.80f);
+        const ImVec2 a(centerX - barWidth * 0.5f, top), b(centerX + barWidth * 0.5f, graph.max.y);
+        panel->AddRectFilled(ImVec2(a.x, graph.min.y), b, withAlpha(kGcBlue, 0.06f));
+        panel->AddRectFilledMultiColor(a, b, withAlpha(color, 0.85f), withAlpha(color, 0.85f), withAlpha(color, 0.25f), withAlpha(color, 0.25f));
+        panel->AddRectFilled(a, ImVec2(b.x, a.y + 2.0f), withAlpha(kGcWhite, 0.9f));
+
+        drawCenteredText(panel, state.displayFont, 8.0f, ImVec2(centerX, graph.max.y + kLabelRow * 0.5f + 1.0f), withAlpha(kGcSky, 0.9f),
+                         format("%02d", i));
+        if (slot >= 24.0f) {
+            drawCenteredText(panel, state.textFont, 13.0f, ImVec2(centerX, std::max(top - 8.0f, start.y + 6.0f)), withAlpha(kGcWhite, 0.9f),
+                             format("%.0f", value));
+        }
+    }
+
+    // The busy mark (80%) as a dashed red line.
+    const float busyY = std::floor(graph.max.y - graph.height() * 0.80f) + 0.5f;
+    for (float x = graph.min.x; x < graph.max.x; x += 10.0f) {
+        panel->AddLine(ImVec2(x, busyY), ImVec2(std::min(x + 6.0f, graph.max.x), busyY), withAlpha(kGcRed, 0.75f));
+    }
+    ImGui::Dummy(room);
+    ImGui::EndChild();
+}
+
+// White title with a gold subtitle; the clock, a blinking red "LIVE" light and
+// the gear on the right; a double rule underneath. Returns the gear's rectangle.
+Box drawGalacticHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    ImFont* display = state.displayFont;
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 3.0f;
+
+    const ImVec2 titleExtent = textSize(display, 18.0f, "VEEASTATS");
+    draw->AddText(display, 18.0f, ImVec2(box.min.x, midY - titleExtent.y * 0.5f), withAlpha(kGcWhite, 1.0f), "VEEASTATS");
+    const float subtitleX = box.min.x + titleExtent.x + 14.0f;
+    draw->AddRectFilled(ImVec2(subtitleX, midY - 2.0f), ImVec2(subtitleX + 4.0f, midY + 2.0f), withAlpha(kGcRed, 1.0f));
+    const ImVec2 subtitleExtent = textSize(display, 9.0f, "TACTICAL READOUT");
+    draw->AddText(display, 9.0f, ImVec2(subtitleX + 10.0f, midY - subtitleExtent.y * 0.5f), withAlpha(kGcGold, 1.0f), "TACTICAL READOUT");
+
+    const Box gear = drawHeaderGear(ui, box.max.x, midY);
+    float right = gear.min.x - 20.0f;
+
+    std::string clock, date;
+    currentClock(clock, date);
+    const ImVec2 clockExtent = textSize(display, 14.0f, clock);
+    right -= clockExtent.x;
+    draw->AddText(display, 14.0f, ImVec2(right, midY - clockExtent.y * 0.5f), withAlpha(kGcWhite, 1.0f), clock.c_str());
+    const ImVec2 dateExtent = textSize(display, 9.0f, date);
+    right -= dateExtent.x + 12.0f;
+    draw->AddText(display, 9.0f, ImVec2(right, midY - dateExtent.y * 0.5f), withAlpha(kGcSky, 1.0f), date.c_str());
+
+    // "■ LIVE": the square blinks while animating.
+    const bool lightOn = !state.animate || fmodf(state.time, 1.2f) < 0.8f;
+    const ImVec2 liveExtent = textSize(display, 9.0f, "LIVE");
+    right -= liveExtent.x + 20.0f;
+    if (lightOn) draw->AddRectFilled(ImVec2(right - 9.0f, midY - 3.0f), ImVec2(right - 3.0f, midY + 3.0f), withAlpha(kGcRed, 1.0f));
+    draw->AddRect(ImVec2(right - 10.0f, midY - 4.0f), ImVec2(right - 2.0f, midY + 4.0f), withAlpha(kGcRed, 0.6f));
+    draw->AddText(display, 9.0f, ImVec2(right + 3.0f, midY - liveExtent.y * 0.5f), withAlpha(kGcRed, 1.0f), "LIVE");
+
+    // Double rule, with a gold stretch at the start and a red block at the end.
+    const float ruleY = std::floor(box.max.y) - 4.5f;
+    draw->AddLine(ImVec2(box.min.x, ruleY), ImVec2(box.max.x, ruleY), withAlpha(kGcBlue, 0.6f));
+    draw->AddLine(ImVec2(box.min.x, ruleY + 3.0f), ImVec2(box.max.x, ruleY + 3.0f), withAlpha(kGcBlue, 0.25f));
+    draw->AddRectFilled(ImVec2(box.min.x, ruleY - 1.0f), ImVec2(box.min.x + 140.0f, ruleY + 1.0f), withAlpha(kGcGold, 0.9f));
+    draw->AddRectFilled(ImVec2(box.max.x - 18.0f, ruleY - 2.0f), ImVec2(box.max.x, ruleY + 2.0f), withAlpha(kGcRed, 0.9f));
+    return gear;
+}
+
+void applyGalacticStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.WindowRounding = style.ChildRounding = style.FrameRounding = style.PopupRounding = 0.0f;
+    style.ScrollbarRounding = style.GrabRounding = 0.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 8.0f;
+
+    auto blue = [](float alpha) { return ImVec4(kGcBlue.x, kGcBlue.y, kGcBlue.z, alpha); };
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = kGcWhite;
+    colors[ImGuiCol_TextDisabled]         = kGcSky;
+    colors[ImGuiCol_WindowBg]             = ImVec4(0.01f, 0.015f, 0.05f, 0.97f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(0.01f, 0.015f, 0.05f, 0.97f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = blue(0.60f);
+    colors[ImGuiCol_FrameBg]              = blue(0.10f);
+    colors[ImGuiCol_FrameBgHovered]       = blue(0.24f);
+    colors[ImGuiCol_FrameBgActive]        = blue(0.34f);
+    colors[ImGuiCol_Button]               = blue(0.14f);
+    colors[ImGuiCol_ButtonHovered]        = blue(0.30f);
+    colors[ImGuiCol_ButtonActive]         = blue(0.42f);
+    colors[ImGuiCol_Header]               = blue(0.24f);
+    colors[ImGuiCol_HeaderHovered]        = blue(0.34f);
+    colors[ImGuiCol_HeaderActive]         = blue(0.44f);
+    colors[ImGuiCol_CheckMark]            = kGcGold;
+    colors[ImGuiCol_Separator]            = blue(0.35f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = blue(0.35f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = blue(0.50f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = blue(0.65f);
+    colors[ImGuiCol_TextSelectedBg]       = blue(0.30f);
+    colors[ImGuiCol_NavCursor]            = kGcGold;
+}
+
+// ---- Federation Gunship -------------------------------------------------------
+// A handheld-console sci-fi look: chunky pixel fonts with black outlines, a deep
+// navy tiled background, dialogue-box panels with pale borders, energy-tank
+// gauges and a "map" of CPU cores lit room by room. Shapes sit on a 2-pixel grid
+// (kPx) and the skin turns anti-aliasing off, so every edge stays crisp.
+
+constexpr float kPx = 2.0f;   // one "console pixel"
+
+const ImVec4 kFgNavy    (0.063f, 0.078f, 0.220f, 1.0f);   // background
+const ImVec4 kFgTile    (0.090f, 0.115f, 0.300f, 1.0f);   // background tile edges
+const ImVec4 kFgPanel   (0.035f, 0.060f, 0.150f, 1.0f);   // dialogue-box fill
+const ImVec4 kFgFrame   (0.780f, 0.820f, 0.930f, 1.0f);   // pale borders
+const ImVec4 kFgShade   (0.250f, 0.300f, 0.480f, 1.0f);   // inner borders, empty cells
+const ImVec4 kFgMagenta (0.900f, 0.250f, 0.900f, 1.0f);   // title; normal load
+const ImVec4 kFgYellow  (0.980f, 0.900f, 0.250f, 1.0f);   // labels; busy
+const ImVec4 kFgRed     (1.000f, 0.250f, 0.330f, 1.0f);   // critical
+const ImVec4 kFgCyan    (0.300f, 0.650f, 1.000f, 1.0f);   // "live", doors
+const ImVec4 kFgGray    (0.560f, 0.570f, 0.620f, 1.0f);   // unlit map rooms
+const ImVec4 kFgWhite   (0.970f, 0.970f, 1.000f, 1.0f);   // values
+
+// Magenta when relaxed, yellow when busy, red when critical.
+const ImVec4& gunshipLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kFgRed : (fraction > warnAt) ? kFgYellow : kFgMagenta;
+}
+
+float snapToPixel(float value) { return std::floor(value / kPx) * kPx; }
+ImVec2 snapToPixel(const ImVec2& point) { return ImVec2(snapToPixel(point.x), snapToPixel(point.y)); }
+
+// Text with an outline all round it (`outline` screen pixels thick), the way
+// games keep text readable on any background.
+void drawOutlinedText(ImDrawList* draw, ImFont* font, float size, const ImVec2& pos, const ImVec4& color, const std::string& text,
+                      float outline = 1.0f, ImU32 outlineColor = IM_COL32(0, 0, 10, 255)) {
+    const ImVec2 at(std::floor(pos.x), std::floor(pos.y));
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            if (dx != 0 || dy != 0) draw->AddText(font, size, at + ImVec2(dx * outline, dy * outline), outlineColor, text.c_str());
+        }
+    }
+    draw->AddText(font, size, at, withAlpha(color, 1.0f), text.c_str());
+}
+
+// Outline of a rectangle, `thickness` thick, drawn inside it as four filled
+// strips (no half-pixel lines). With `cutCorners`, the corner pixels are left
+// out, which rounds the box the way 16-bit era menus do.
+void drawPixelOutline(ImDrawList* draw, const ImVec2& a, const ImVec2& b, ImU32 color, float thickness, bool cutCorners) {
+    const float cut = cutCorners ? thickness : 0.0f;
+    draw->AddRectFilled(ImVec2(a.x + cut, a.y), ImVec2(b.x - cut, a.y + thickness), color);
+    draw->AddRectFilled(ImVec2(a.x + cut, b.y - thickness), ImVec2(b.x - cut, b.y), color);
+    draw->AddRectFilled(ImVec2(a.x, a.y + thickness), ImVec2(a.x + thickness, b.y - thickness), color);
+    draw->AddRectFilled(ImVec2(b.x - thickness, a.y + thickness), ImVec2(b.x, b.y - thickness), color);
+}
+
+// A dialogue box: dark fill, a pale outer border with clipped corners and a
+// thin darker border just inside it.
+void drawPixelBox(ImDrawList* draw, const Box& box, float fillAlpha) {
+    const ImVec2 a = snapToPixel(box.min), b = snapToPixel(box.max);
+    draw->AddRectFilled(a + ImVec2(kPx, kPx), b - ImVec2(kPx, kPx), withAlpha(kFgPanel, fillAlpha));
+    drawPixelOutline(draw, a, b, withAlpha(kFgFrame, 1.0f), kPx, true);
+    drawPixelOutline(draw, a + ImVec2(kPx * 2, kPx * 2), b - ImVec2(kPx * 2, kPx * 2), withAlpha(kFgShade, 1.0f), kPx * 0.5f, false);
+}
+
+// Deep navy with a tiled grid (each tile has a darker bevel on two sides), like
+// the walls of a ship's corridor.
+void drawGunshipBackground(const ImVec2& size, const HudState&) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), size, withAlpha(kFgNavy, 1.0f));
+    constexpr float kTile = 32.0f;
+    for (float y = 0.0f; y < size.y; y += kTile) {
+        for (float x = 0.0f; x < size.x; x += kTile) {
+            if ((static_cast<int>(x / kTile) + static_cast<int>(y / kTile)) % 2 == 0) {
+                draw->AddRectFilled(ImVec2(x, y), ImVec2(x + kTile, y + kTile), withAlpha(kFgTile, 0.35f));
+            }
+            draw->AddRectFilled(ImVec2(x, y + kTile - kPx), ImVec2(x + kTile, y + kTile), withAlpha(kFgTile, 1.0f));
+            draw->AddRectFilled(ImVec2(x + kTile - kPx, y), ImVec2(x + kTile, y + kTile), withAlpha(kFgTile, 1.0f));
+        }
+    }
+}
+
+// A small down-arrow, like the "more text" prompt at the end of a dialogue
+// box. Drawn as stacked pixel rows so it stays crisp.
+void drawPixelArrow(ImDrawList* draw, const ImVec2& topLeft, ImU32 color) {
+    const ImVec2 at = snapToPixel(topLeft);
+    for (int row = 0; row < 4; ++row) {
+        const float inset = kPx * static_cast<float>(row);
+        draw->AddRectFilled(ImVec2(at.x + inset, at.y + kPx * row), ImVec2(at.x + kPx * 7 - inset, at.y + kPx * (row + 1)), color);
+    }
+}
+
+// A dialogue-box panel with its title in yellow, a magenta marker before it and
+// a dotted rule after it. While animating, a "more" arrow blinks in the
+// bottom-right corner. Returns the area for content.
+Box drawGunshipPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    drawPixelBox(draw, box, 0.90f);
+    const ImVec2 a = snapToPixel(box.min), b = snapToPixel(box.max);
+    const float titleY = a.y + 10.0f;
+    draw->AddRectFilled(ImVec2(a.x + 10.0f, titleY), ImVec2(a.x + 18.0f, titleY + 8.0f), withAlpha(kFgMagenta, 1.0f));
+    drawOutlinedText(draw, state.displayFont, 8.0f, ImVec2(a.x + 24.0f, titleY), kFgYellow, title);
+    const float ruleLeft = a.x + 34.0f + textSize(state.displayFont, 8.0f, title).x;
+    for (float x = snapToPixel(ruleLeft); x < b.x - 12.0f; x += kPx * 3) {
+        draw->AddRectFilled(ImVec2(x, titleY + 4.0f), ImVec2(x + kPx, titleY + 4.0f + kPx), withAlpha(kFgFrame, 0.35f));
+    }
+    if (state.animate && fmodf(state.time, 1.0f) < 0.6f) drawPixelArrow(draw, ImVec2(b.x - 24.0f, b.y - 16.0f), withAlpha(kFgWhite, 0.9f));
+    return Box{ImVec2(a.x + 12.0f, titleY + 18.0f), ImVec2(b.x - 12.0f, b.y - 12.0f)};
+}
+
+// "LABEL   value": a small yellow pixel label, the value in the pixel text font.
+void drawGunshipInfoRow(const HudState& state, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(state.displayFont, 8.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5.0f);   // line the small label up with the taller value
+    ImGui::TextColored(kFgYellow, "%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// A row of "energy tanks": `count` square cells, the first `lit` filled.
+void drawEnergyTanks(ImDrawList* draw, const ImVec2& topLeft, int count, int lit, float cell, float gap, const ImVec4& color) {
+    for (int i = 0; i < count; ++i) {
+        const ImVec2 a = snapToPixel(topLeft + ImVec2((cell + gap) * static_cast<float>(i), 0.0f));
+        const ImVec2 b = a + ImVec2(cell, cell);
+        if (i < lit) {
+            draw->AddRectFilled(a, b, withAlpha(color, 1.0f));
+            draw->AddRectFilled(a + ImVec2(kPx, kPx), a + ImVec2(kPx * 2, kPx * 2), withAlpha(kFgWhite, 0.85f));   // a glint
+        } else {
+            draw->AddRectFilled(a, b, withAlpha(kFgPanel, 1.0f));
+        }
+        drawPixelOutline(draw, a, b, withAlpha(i < lit ? kFgFrame : kFgShade, 1.0f), kPx, false);
+    }
+}
+
+// An energy readout per gauge, each in its own dialogue box: the label, a big
+// pixel number, a row of ten energy tanks (one per 10%), a fine bar and the
+// two readout lines.
+void drawGunshipGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    constexpr float kGap = 12.0f;
+    const float columnWidth = std::floor((box.width() - kGap * 3.0f) / 4.0f);
+    for (int i = 0; i < 4; ++i) {
+        const GaugeReading& reading = readings[i];
+        const Box column{ImVec2(box.min.x + (columnWidth + kGap) * static_cast<float>(i), box.min.y),
+                         ImVec2(box.min.x + (columnWidth + kGap) * static_cast<float>(i) + columnWidth, box.max.y)};
+        drawPixelBox(draw, column, 0.88f);
+
+        const float percent = std::clamp(reading.percent, 0.0f, 100.0f);
+        const ImVec4& color = gunshipLoadColor(percent, reading.warnAt, reading.critAt);
+        const float centerX = std::floor((column.min.x + column.max.x) * 0.5f);
+        const float contentHeight = 8.0f + 12.0f + 32.0f + 14.0f + 14.0f + 10.0f + 8.0f + 14.0f + 16.0f + 4.0f + 16.0f;
+        float y = snapToPixel(column.min.y + std::max((column.height() - contentHeight) * 0.5f, 12.0f));
+
+        drawOutlinedText(draw, state.displayFont, 8.0f, ImVec2(column.min.x + 12.0f, y), kFgYellow, reading.label);
+        y += 8.0f + 12.0f;
+
+        if (reading.hasValue) {
+            const std::string number = format("%.0f", percent);
+            const ImVec2 numberExtent = textSize(state.displayFont, 32.0f, number);
+            const float left = centerX - (numberExtent.x + 18.0f) * 0.5f;
+            drawOutlinedText(draw, state.displayFont, 32.0f, ImVec2(left, y), kFgWhite, number, kPx);
+            drawOutlinedText(draw, state.displayFont, 16.0f, ImVec2(left + numberExtent.x + 2.0f, y + 16.0f), color, "%", kPx);
+        } else {
+            const ImVec2 naExtent = textSize(state.displayFont, 16.0f, "N/A");
+            drawOutlinedText(draw, state.displayFont, 16.0f, ImVec2(centerX - naExtent.x * 0.5f, y + 8.0f), kFgGray, "N/A", kPx);
+        }
+        y += 32.0f + 14.0f;
+
+        constexpr int kTanks = 10;
+        constexpr float kTankGap = 4.0f;
+        const float cell = std::clamp(snapToPixel((column.width() - 28.0f - kTankGap * (kTanks - 1)) / kTanks), 6.0f, 14.0f);
+        const float tanksWidth = cell * kTanks + kTankGap * (kTanks - 1);
+        const int lit = reading.hasValue ? static_cast<int>(std::lround(percent / 10.0f)) : 0;
+        drawEnergyTanks(draw, ImVec2(centerX - tanksWidth * 0.5f, y), kTanks, lit, cell, kTankGap, color);
+        y += 14.0f + 10.0f;
+
+        const ImVec2 barA = snapToPixel(ImVec2(centerX - tanksWidth * 0.5f, y)), barB = snapToPixel(ImVec2(centerX + tanksWidth * 0.5f, y + 8.0f));
+        draw->AddRectFilled(barA, barB, withAlpha(kFgPanel, 1.0f));
+        if (reading.hasValue) {
+            const float fillRight = snapToPixel(barA.x + kPx + (barB.x - barA.x - kPx * 2) * percent / 100.0f);
+            draw->AddRectFilled(barA + ImVec2(kPx, kPx), ImVec2(fillRight, barB.y - kPx), withAlpha(color, 1.0f));
+        }
+        drawPixelOutline(draw, barA, barB, withAlpha(kFgShade, 1.0f), kPx, false);
+        y += 8.0f + 14.0f;
+
+        const ImVec2 line1Extent = textSize(state.textFont, 16.0f, reading.line1);
+        drawOutlinedText(draw, state.textFont, 16.0f, ImVec2(centerX - line1Extent.x * 0.5f, y), kFgWhite, reading.line1);
+        y += 16.0f + 4.0f;
+        const ImVec2 line2Extent = textSize(state.textFont, 16.0f, reading.line2);
+        drawOutlinedText(draw, state.textFont, 16.0f, ImVec2(centerX - line2Extent.x * 0.5f, y), kFgFrame, reading.line2);
+    }
+}
+
+// The cores as rooms on a map: grey rooms that fill from the floor with the
+// load colour, pale walls, and small blue doors between neighbours.
+void drawGunshipCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawGunshipPanelFrame(draw, box, format("CORE MAP - %zu THREADS", state.cores.size()), state), "##GunshipCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = snapToPixel(ImGui::GetCursorScreenPos());
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    constexpr float kGap = 6.0f, kMinWidth = 62.0f, kMinHeight = 34.0f, kMaxHeight = 52.0f;
+    const int count = static_cast<int>(state.cores.size());
+    const int columns = std::clamp(static_cast<int>((room.x + kGap) / (kMinWidth + kGap)), 1, std::max(count, 1));
+    const int rows = (count + columns - 1) / std::max(columns, 1);
+    const float cellWidth = snapToPixel((room.x - kGap * static_cast<float>(columns - 1)) / static_cast<float>(columns));
+    const float cellHeight = snapToPixel(std::clamp((room.y - kGap * static_cast<float>(rows - 1)) / static_cast<float>(std::max(rows, 1)),
+                                                    kMinHeight, kMaxHeight));
+
+    for (int i = 0; i < count; ++i) {
+        const int column = i % columns, row = i / columns;
+        const ImVec2 a = start + ImVec2((cellWidth + kGap) * static_cast<float>(column), (cellHeight + kGap) * static_cast<float>(row));
+        const ImVec2 b = a + ImVec2(cellWidth, cellHeight);
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const float floorY = snapToPixel(b.y - kPx - (cellHeight - kPx * 2) * value / 100.0f);
+
+        panel->AddRectFilled(a, b, withAlpha(kFgGray, 0.85f));
+        panel->AddRectFilled(ImVec2(a.x + kPx, floorY), b - ImVec2(kPx, kPx), withAlpha(gunshipLoadColor(value, 0.50f, 0.80f), 1.0f));
+        drawPixelOutline(panel, a, b, withAlpha(kFgWhite, 0.95f), kPx, false);
+        if (column + 1 < columns && i + 1 < count) {   // a door to the next room
+            const float doorY = snapToPixel((a.y + b.y) * 0.5f - 4.0f);
+            panel->AddRectFilled(ImVec2(b.x, doorY), ImVec2(b.x + kGap, doorY + 8.0f), withAlpha(kFgCyan, 1.0f));
+        }
+
+        drawOutlinedText(panel, state.displayFont, 8.0f, a + ImVec2(6.0f, 6.0f), kFgWhite, format("C%02d", i));
+        const std::string text = format("%.0f%%", value);
+        const ImVec2 extent = textSize(state.textFont, 16.0f, text);
+        drawOutlinedText(panel, state.textFont, 16.0f, ImVec2(b.x - extent.x - 6.0f, b.y - extent.y - 4.0f), kFgWhite, text);
+    }
+    ImGui::Dummy(ImVec2(room.x, (cellHeight + kGap) * static_cast<float>(rows) - kGap));
+    ImGui::EndChild();
+}
+
+// Magenta pixel title; a "LIVE" legend with a blinking blue light, the clock and
+// the gear on the right; a pale rule with notches underneath. Returns the gear's rectangle.
+Box drawGunshipHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    ImFont* display = state.displayFont;
+    const float midY = snapToPixel((box.min.y + box.max.y) * 0.5f) - 4.0f;
+
+    drawOutlinedText(draw, display, 16.0f, ImVec2(box.min.x, midY - 8.0f), kFgMagenta, "VEEASTATS", kPx);
+    drawOutlinedText(draw, display, 8.0f, ImVec2(box.min.x + textSize(display, 16.0f, "VEEASTATS").x + 14.0f, midY - 2.0f), kFgYellow,
+                  "SYSTEM STATUS");
+
+    const Box gear = drawHeaderGear(ui, box.max.x, midY);
+    float right = gear.min.x - 18.0f;
+
+    std::string clock, date;
+    currentClock(clock, date);
+    right -= textSize(display, 16.0f, clock).x;
+    drawOutlinedText(draw, display, 16.0f, ImVec2(right, midY - 8.0f), kFgWhite, clock, kPx);
+    right -= textSize(display, 8.0f, date).x + 14.0f;
+    drawOutlinedText(draw, display, 8.0f, ImVec2(right, midY - 3.0f), kFgFrame, date);
+
+    // "LIVE ■", like a map legend entry; the light blinks while animating.
+    right -= 14.0f;
+    const bool lightOn = !state.animate || fmodf(state.time, 1.0f) < 0.6f;
+    draw->AddRectFilled(ImVec2(right, midY - 4.0f), ImVec2(right + 8.0f, midY + 4.0f), withAlpha(lightOn ? kFgCyan : kFgShade, 1.0f));
+    drawPixelOutline(draw, ImVec2(right - kPx, midY - 4.0f - kPx), ImVec2(right + 8.0f + kPx, midY + 4.0f + kPx), IM_COL32(0, 0, 10, 255), kPx, false);
+    right -= textSize(display, 8.0f, "LIVE").x + 8.0f;
+    drawOutlinedText(draw, display, 8.0f, ImVec2(right, midY - 3.0f), kFgCyan, "LIVE");
+
+    const float ruleY = snapToPixel(box.max.y) - kPx * 3;
+    draw->AddRectFilled(ImVec2(box.min.x, ruleY), ImVec2(box.max.x, ruleY + kPx), withAlpha(kFgFrame, 0.9f));
+    for (float x = snapToPixel(box.min.x); x < box.max.x; x += 16.0f) {
+        draw->AddRectFilled(ImVec2(x, ruleY + kPx), ImVec2(x + kPx, ruleY + kPx * 3), withAlpha(kFgFrame, 0.6f));
+    }
+    return gear;
+}
+
+void applyGunshipStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 4.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.WindowRounding = style.ChildRounding = style.FrameRounding = style.PopupRounding = 0.0f;
+    style.ScrollbarRounding = style.GrabRounding = 0.0f;
+    style.WindowBorderSize = kPx;
+    style.PopupBorderSize = kPx;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 10.0f;
+    style.AntiAliasedLines = style.AntiAliasedFill = false;   // crisp pixel edges
+    style.AntiAliasedLinesUseTex = false;
+
+    ImVec4* colors = style.Colors;
+    auto magenta = [](float alpha) { return ImVec4(kFgMagenta.x, kFgMagenta.y, kFgMagenta.z, alpha); };
+    colors[ImGuiCol_Text]                 = kFgWhite;
+    colors[ImGuiCol_TextDisabled]         = ImVec4(0.66f, 0.70f, 0.86f, 1.0f);
+    colors[ImGuiCol_WindowBg]             = ImVec4(kFgPanel.x, kFgPanel.y, kFgPanel.z, 0.97f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(kFgPanel.x, kFgPanel.y, kFgPanel.z, 0.97f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = kFgFrame;
+    colors[ImGuiCol_FrameBg]              = ImVec4(0.12f, 0.16f, 0.38f, 1.0f);
+    colors[ImGuiCol_FrameBgHovered]       = ImVec4(0.22f, 0.20f, 0.50f, 1.0f);
+    colors[ImGuiCol_FrameBgActive]        = magenta(0.55f);
+    colors[ImGuiCol_Button]               = ImVec4(0.12f, 0.16f, 0.38f, 1.0f);
+    colors[ImGuiCol_ButtonHovered]        = magenta(0.40f);
+    colors[ImGuiCol_ButtonActive]         = magenta(0.60f);
+    colors[ImGuiCol_Header]               = magenta(0.35f);
+    colors[ImGuiCol_HeaderHovered]        = magenta(0.50f);
+    colors[ImGuiCol_HeaderActive]         = magenta(0.65f);
+    colors[ImGuiCol_CheckMark]            = kFgMagenta;
+    colors[ImGuiCol_Separator]            = ImVec4(kFgFrame.x, kFgFrame.y, kFgFrame.z, 0.45f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = kFgShade;
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(kFgFrame.x, kFgFrame.y, kFgFrame.z, 0.7f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = kFgFrame;
+    colors[ImGuiCol_TextSelectedBg]       = magenta(0.35f);
+    colors[ImGuiCol_NavCursor]            = kFgYellow;
+}
+
+// ---- Halloween ------------------------------------------------------------------
+// A spooky game-menu look: a violet night with a big moon, bare trees and bats;
+// slate-stone panels with thick outlines, title plaques and cobwebs; orange goo
+// dripping under the header; jack-o'-lantern gauges that glow brighter as the
+// load rises; and core tiles that fill with goo.
+//
+// Henny Penny's letters only fill about half of its nominal size (its tall
+// swashes set the line height), so it is used about 1.4x larger than the other fonts.
+
+const ImVec4 kHwNight   (0.075f, 0.035f, 0.130f, 1.0f);   // background, top
+const ImVec4 kHwDusk    (0.190f, 0.075f, 0.290f, 1.0f);   // background, bottom
+const ImVec4 kHwTree    (0.035f, 0.015f, 0.060f, 1.0f);   // tree and bat silhouettes
+const ImVec4 kHwStone   (0.290f, 0.285f, 0.345f, 1.0f);   // panel fill
+const ImVec4 kHwStoneLit(0.430f, 0.425f, 0.510f, 1.0f);   // panel highlights
+const ImVec4 kHwOutline (0.075f, 0.045f, 0.105f, 1.0f);   // thick outlines
+const ImVec4 kHwPlaque  (0.165f, 0.155f, 0.205f, 1.0f);   // title plaques, empty tracks
+const ImVec4 kHwOrange  (1.000f, 0.560f, 0.120f, 1.0f);   // pumpkins, goo; normal load
+const ImVec4 kHwGlow    (1.000f, 0.880f, 0.350f, 1.0f);   // candle light
+const ImVec4 kHwPurple  (0.700f, 0.380f, 1.000f, 1.0f);   // busy
+const ImVec4 kHwRed     (1.000f, 0.200f, 0.260f, 1.0f);   // critical
+const ImVec4 kHwBone    (0.965f, 0.945f, 0.905f, 1.0f);   // text
+const ImVec4 kHwMist    (0.780f, 0.720f, 0.880f, 1.0f);   // secondary text
+const ImVec4 kHwWeb     (0.900f, 0.900f, 0.940f, 1.0f);   // cobwebs
+const ImVec4 kHwStem    (0.340f, 0.520f, 0.180f, 1.0f);   // pumpkin stems
+
+// Pumpkin orange when relaxed, witch purple when busy, red when critical.
+const ImVec4& halloweenLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kHwRed : (fraction > warnAt) ? kHwPurple : kHwOrange;
+}
+
+ImVec4 mix(const ImVec4& a, const ImVec4& b, float t) {
+    return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+}
+
+// A bare branch and its twigs, drawn recursively as tapering lines.
+void drawBranch(ImDrawList* draw, const ImVec2& from, float angle, float length, float thickness, int depth, int seed) {
+    const ImVec2 to = from + ImVec2(cosf(angle), sinf(angle)) * length;
+    draw->AddLine(from, to, withAlpha(kHwTree, 1.0f), thickness);
+    if (depth == 0) return;
+    for (int i = 0; i < 2; ++i) {
+        const float spread = 0.35f + 0.4f * hash01(seed * 7 + i);
+        drawBranch(draw, to, angle + (i == 0 ? -spread : spread), length * (0.62f + 0.18f * hash01(seed * 13 + i)), thickness * 0.65f,
+                   depth - 1, seed * 3 + i + 1);
+    }
+}
+
+// A bat: a small body and two pointed wings that flap.
+void drawBat(ImDrawList* draw, const ImVec2& center, float size, float flap) {
+    const ImU32 color = withAlpha(kHwTree, 1.0f);
+    const float lift = size * 0.45f * flap;
+    for (const float side : {-1.0f, 1.0f}) {
+        const ImVec2 wing[] = {center, center + ImVec2(side * size * 0.55f, -size * 0.25f - lift),
+                               center + ImVec2(side * size * 1.1f, -size * 0.05f - lift), center + ImVec2(side * size * 0.75f, size * 0.12f),
+                               center + ImVec2(side * size * 0.45f, size * 0.02f)};
+        draw->AddConcavePolyFilled(wing, 5, color);
+    }
+    draw->AddCircleFilled(center, size * 0.2f, color);
+}
+
+// Violet night: a big moon with a soft glow, twinkling stars, bare trees in the
+// bottom corners, and (while animating) a few bats drifting across.
+void drawHalloweenBackground(const ImVec2& size, const HudState& state) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    const ImU32 top = withAlpha(kHwNight, 1.0f), bottom = withAlpha(kHwDusk, 1.0f);
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), size, top, top, bottom, bottom);
+
+    for (int i = 0; i < 70; ++i) {
+        const ImVec2 star(hash01(i * 3) * size.x, hash01(i * 3 + 1) * size.y * 0.75f);
+        const float twinkle = state.animate ? 0.6f + 0.4f * sinf(state.time * (1.0f + hash01(i)) * 2.0f + static_cast<float>(i)) : 0.8f;
+        draw->AddCircleFilled(star, 0.8f + hash01(i * 3 + 2) * 1.0f, withAlpha(kHwBone, 0.55f * twinkle));
+    }
+
+    const ImVec2 moon(size.x * 0.84f, size.y * 0.16f);
+    const float moonRadius = std::min(size.x, size.y) * 0.09f;
+    for (int i = 3; i >= 1; --i) draw->AddCircleFilled(moon, moonRadius * (1.0f + 0.35f * static_cast<float>(i)), withAlpha(kHwGlow, 0.035f));
+    draw->AddCircleFilled(moon, moonRadius, IM_COL32(255, 244, 214, 235));
+    draw->AddCircleFilled(moon + ImVec2(-moonRadius * 0.3f, -moonRadius * 0.2f), moonRadius * 0.18f, IM_COL32(220, 205, 175, 160));
+    draw->AddCircleFilled(moon + ImVec2(moonRadius * 0.35f, moonRadius * 0.25f), moonRadius * 0.12f, IM_COL32(220, 205, 175, 160));
+
+    const float treeHeight = size.y * 0.22f;
+    drawBranch(draw, ImVec2(size.x * 0.03f, size.y), -kPi * 0.45f, treeHeight, 9.0f, 5, 1);
+    drawBranch(draw, ImVec2(size.x * 0.97f, size.y), -kPi * 0.56f, treeHeight * 0.9f, 8.0f, 5, 2);
+
+    if (state.animate) {
+        for (int i = 0; i < 3; ++i) {
+            const float speed = 18.0f + 8.0f * static_cast<float>(i);
+            const float x = fmodf(state.time * speed + static_cast<float>(i) * 310.0f, size.x + 120.0f) - 60.0f;
+            const float y = size.y * (0.10f + 0.07f * static_cast<float>(i)) + sinf(state.time * 1.3f + static_cast<float>(i)) * 10.0f;
+            drawBat(draw, ImVec2(x, y), 11.0f - static_cast<float>(i) * 2.0f, sinf(state.time * 9.0f + static_cast<float>(i) * 2.0f));
+        }
+    }
+}
+
+// A slate-stone slab: a dark outline round a rounded stone face that is a
+// little lighter at the top, a thin highlight just inside the edge, and a few
+// faint specks so it doesn't look flat.
+void drawStoneSlab(ImDrawList* draw, const Box& box, float rounding, float alpha) {
+    constexpr float kOutline = 3.0f;
+    draw->AddRectFilled(box.min + ImVec2(2.0f, 4.0f), box.max + ImVec2(2.0f, 4.0f), IM_COL32(0, 0, 0, static_cast<int>(70 * alpha)), rounding + kOutline);
+    draw->AddRectFilled(box.min - ImVec2(kOutline, kOutline), box.max + ImVec2(kOutline, kOutline), withAlpha(kHwOutline, alpha),
+                        rounding + kOutline);
+    draw->AddRectFilled(box.min, box.max, withAlpha(kHwStone, alpha), rounding);
+    draw->AddRectFilled(box.min, ImVec2(box.max.x, box.min.y + std::min(box.height() * 0.45f, 60.0f)), withAlpha(kHwStoneLit, 0.25f * alpha),
+                        rounding, ImDrawFlags_RoundCornersTop);
+    draw->AddRect(box.min + ImVec2(3.0f, 3.0f), box.max - ImVec2(3.0f, 3.0f), withAlpha(kHwStoneLit, 0.45f * alpha), std::max(rounding - 3.0f, 0.0f),
+                  0, 1.5f);
+    const int seed = static_cast<int>(box.min.x * 7.0f + box.min.y * 13.0f);
+    for (int i = 0; i < static_cast<int>(box.width() * box.height() / 2500.0f); ++i) {
+        const ImVec2 speck(box.min.x + 8.0f + hash01(seed + i * 2) * (box.width() - 16.0f),
+                           box.min.y + 8.0f + hash01(seed + i * 2 + 1) * (box.height() - 16.0f));
+        draw->AddCircleFilled(speck, 1.0f + 2.0f * hash01(seed + i), withAlpha(kHwOutline, 0.12f * alpha));
+    }
+}
+
+// A cobweb spanning a corner: threads fanning out from `corner`, joined by
+// sagging strands. `xSign`/`ySign` (+1 or -1) say which way the web opens.
+void drawCobweb(ImDrawList* draw, const ImVec2& corner, float size, float xSign, float ySign, float alpha) {
+    const ImU32 color = withAlpha(kHwWeb, alpha);
+    constexpr int kThreads = 5;
+    ImVec2 ends[kThreads];
+    for (int i = 0; i < kThreads; ++i) {
+        const float angle = kPi * 0.5f * static_cast<float>(i) / (kThreads - 1);
+        ends[i] = ImVec2(cosf(angle) * xSign, sinf(angle) * ySign);
+        draw->AddLine(corner, corner + ends[i] * size, color, 1.0f);
+    }
+    for (const float ring : {0.35f, 0.62f, 0.9f}) {
+        for (int i = 0; i + 1 < kThreads; ++i) {
+            const ImVec2 a = corner + ends[i] * size * ring, b = corner + ends[i + 1] * size * ring;
+            draw->AddBezierQuadratic(a, (a + b) * 0.5f + (corner - (a + b) * 0.5f) * 0.18f, b, color, 1.0f);   // sags towards the corner
+        }
+    }
+}
+
+// Text with a dark outline all round, like game-menu titles.
+void drawHalloweenText(ImDrawList* draw, ImFont* font, float size, const ImVec2& pos, const ImVec4& color, const std::string& text,
+                       float outline = 2.0f) {
+    drawOutlinedText(draw, font, size, pos, color, text, outline, withAlpha(kHwOutline, 1.0f));
+}
+
+// A dark rounded plaque centred on `centerX`, its top at `top`, holding `text`.
+void drawPlaque(ImDrawList* draw, ImFont* font, float size, float centerX, float top, const std::string& text) {
+    const ImVec2 extent = textSize(font, size, text);
+    const Box plaque{ImVec2(std::floor(centerX - extent.x * 0.5f - 14.0f), top), ImVec2(std::floor(centerX + extent.x * 0.5f + 14.0f), top + extent.y + 6.0f)};
+    draw->AddRectFilled(plaque.min - ImVec2(2.0f, 2.0f), plaque.max + ImVec2(2.0f, 2.0f), withAlpha(kHwOutline, 1.0f), 9.0f);
+    draw->AddRectFilled(plaque.min, plaque.max, withAlpha(kHwPlaque, 1.0f), 7.0f);
+    draw->AddLine(ImVec2(plaque.min.x + 6.0f, plaque.min.y + 2.0f), ImVec2(plaque.max.x - 6.0f, plaque.min.y + 2.0f), withAlpha(kHwStoneLit, 0.6f), 1.0f);
+    drawHalloweenText(draw, font, size, ImVec2(centerX - extent.x * 0.5f, top + 3.0f), kHwBone, text, 1.5f);
+}
+
+// A band of orange goo with drips hanging from it. While animating, the drips
+// slowly stretch and shrink.
+void drawGooBand(ImDrawList* draw, const Box& band, const HudState& state) {
+    draw->AddRectFilled(band.min - ImVec2(0.0f, 2.0f), band.max + ImVec2(0.0f, 2.0f), withAlpha(kHwOutline, 1.0f), band.height() * 0.5f + 2.0f);
+    draw->AddRectFilled(band.min, band.max, withAlpha(kHwOrange, 1.0f), band.height() * 0.5f);
+    for (float x = band.min.x + 14.0f; x < band.max.x - 14.0f; x += 23.0f) {
+        const int i = static_cast<int>(x);
+        const float width = 5.0f + 4.0f * hash01(i);
+        const float wobble = state.animate ? 2.5f * sinf(state.time * 1.5f + hash01(i + 1) * 6.0f) : 0.0f;
+        const float length = 3.0f + 13.0f * hash01(i + 2) + wobble;
+        const ImVec2 a(x - width * 0.5f, band.max.y - 2.0f), b(x + width * 0.5f, band.max.y + length);
+        draw->AddRectFilled(a - ImVec2(1.5f, 0.0f), b + ImVec2(1.5f, 1.5f), withAlpha(kHwOutline, 1.0f), width * 0.5f + 1.5f,
+                            ImDrawFlags_RoundCornersBottom);
+        draw->AddRectFilled(a, b, withAlpha(kHwOrange, 1.0f), width * 0.5f, ImDrawFlags_RoundCornersBottom);
+    }
+    draw->AddLine(ImVec2(band.min.x + band.height(), band.min.y + 2.0f), ImVec2(band.max.x - band.height(), band.min.y + 2.0f),
+                  withAlpha(kHwGlow, 0.7f), 1.5f);   // a wet highlight along the top
+}
+
+// A jack-o'-lantern whose carved face glows brighter as `glow` (0..1) rises.
+// While animating, the candle inside flickers.
+void drawJackOLantern(ImDrawList* draw, const ImVec2& center, float radius, float glow, const HudState& state, int seed) {
+    if (state.animate) glow *= 0.88f + 0.12f * sinf(state.time * 13.0f + static_cast<float>(seed)) * sinf(state.time * 7.0f + static_cast<float>(seed) * 2.0f);
+    glow = std::clamp(glow, 0.12f, 1.0f);
+
+    // Halo, then the body: an outline, then five overlapping ribs, darkest at the sides.
+    for (int i = 3; i >= 1; --i) draw->AddCircleFilled(center, radius * (1.0f + 0.22f * static_cast<float>(i)), withAlpha(kHwOrange, 0.05f * glow));
+    const ImVec2 ribs[] = {{-0.48f, 0.0f}, {0.48f, 0.0f}, {-0.24f, 0.0f}, {0.24f, 0.0f}, {0.0f, 0.0f}};
+    const float ribWidths[] = {0.52f, 0.52f, 0.55f, 0.55f, 0.55f};
+    const float ribShades[] = {0.62f, 0.62f, 0.80f, 0.80f, 1.0f};
+    for (int i = 0; i < 5; ++i) {
+        draw->AddEllipseFilled(center + ribs[i] * radius, ImVec2(ribWidths[i] * radius + 2.5f, 0.82f * radius + 2.5f), withAlpha(kHwOutline, 1.0f));
+    }
+    for (int i = 0; i < 5; ++i) {
+        const ImVec4 shade = mix(ImVec4(0.55f, 0.20f, 0.04f, 1.0f), kHwOrange, ribShades[i]);
+        draw->AddEllipseFilled(center + ribs[i] * radius, ImVec2(ribWidths[i] * radius, 0.82f * radius), withAlpha(shade, 1.0f));
+    }
+    // Stem.
+    const ImVec2 stemBase = center + ImVec2(0.0f, -0.78f * radius);
+    const ImVec2 stem[] = {stemBase + ImVec2(-0.09f, 0.05f) * radius, stemBase + ImVec2(-0.05f, -0.30f) * radius,
+                           stemBase + ImVec2(0.14f, -0.36f) * radius, stemBase + ImVec2(0.09f, 0.05f) * radius};
+    draw->AddConvexPolyFilled(stem, 4, withAlpha(kHwStem, 1.0f));
+    draw->AddPolyline(stem, 4, withAlpha(kHwOutline, 1.0f), ImDrawFlags_Closed, 2.0f);
+
+    // The carved face, lit from inside.
+    const ImU32 lit = withAlpha(mix(ImVec4(0.30f, 0.09f, 0.02f, 1.0f), kHwGlow, glow), 1.0f);
+    for (const float side : {-1.0f, 1.0f}) {
+        draw->AddTriangleFilled(center + ImVec2(side * 0.40f, -0.08f) * radius, center + ImVec2(side * 0.12f, -0.08f) * radius,
+                                center + ImVec2(side * 0.26f, -0.42f) * radius, lit);
+    }
+    draw->AddTriangleFilled(center + ImVec2(-0.07f, 0.10f) * radius, center + ImVec2(0.07f, 0.10f) * radius, center + ImVec2(0.0f, -0.03f) * radius, lit);
+    const ImVec2 mouth[] = {center + ImVec2(-0.52f, 0.20f) * radius, center + ImVec2(-0.30f, 0.30f) * radius, center + ImVec2(-0.22f, 0.20f) * radius,
+                            center + ImVec2(-0.10f, 0.32f) * radius, center + ImVec2(0.06f, 0.22f) * radius,  center + ImVec2(0.20f, 0.32f) * radius,
+                            center + ImVec2(0.30f, 0.21f) * radius,  center + ImVec2(0.52f, 0.20f) * radius,  center + ImVec2(0.30f, 0.52f) * radius,
+                            center + ImVec2(-0.30f, 0.52f) * radius};
+    draw->AddConcavePolyFilled(mouth, 10, lit);
+}
+
+// A chunky arc: an outlined dark track with the value filled in over it, with
+// rounded ends and a glossy highlight, like the game's progress bars.
+void drawGooArc(ImDrawList* draw, const ImVec2& center, float radius, float thickness, float from, float sweep, float fraction, const ImVec4& color) {
+    const auto stroke = [&](float a, float b, ImU32 c, float t) {
+        draw->PathArcTo(center, radius, a, b, 48);
+        draw->PathStroke(c, 0, t);
+        draw->AddCircleFilled(pointOnCircle(center, radius, a), t * 0.5f, c);
+        draw->AddCircleFilled(pointOnCircle(center, radius, b), t * 0.5f, c);
+    };
+    stroke(from, from + sweep, withAlpha(kHwOutline, 1.0f), thickness + 6.0f);
+    stroke(from, from + sweep, withAlpha(kHwPlaque, 1.0f), thickness);
+    if (fraction > 0.005f) {
+        const float to = from + sweep * std::clamp(fraction, 0.0f, 1.0f);
+        stroke(from, to, withAlpha(color, 1.0f), thickness);
+        draw->PathArcTo(center, radius + thickness * 0.22f, from, to, 48);
+        draw->PathStroke(withAlpha(kHwBone, 0.35f), 0, thickness * 0.22f);
+    }
+}
+
+// A gauge: a jack-o'-lantern inside a chunky 270-degree ring, the label on a
+// plaque at the top, the number in the ring's opening and the readouts below.
+void drawHalloweenGauge(ImDrawList* draw, const ImVec2& center, float radius, const GaugeReading& reading, const HudState& state, int seed) {
+    constexpr float kStart = kPi * 0.75f, kSweep = kPi * 1.5f;
+    const float percent = std::clamp(reading.percent, 0.0f, 100.0f);
+    const ImVec4& color = halloweenLoadColor(percent, reading.warnAt, reading.critAt);
+    const float thickness = std::max(radius * 0.15f, 7.0f);
+    drawGooArc(draw, center, radius - thickness * 0.5f - 3.0f, thickness, kStart, kSweep, reading.hasValue ? percent / 100.0f : 0.0f, color);
+    drawJackOLantern(draw, center + ImVec2(0.0f, -radius * 0.04f), radius * 0.50f, reading.hasValue ? percent / 100.0f : 0.0f, state, seed);
+
+    const float numberSize = std::round(std::max(radius * 0.42f, 22.0f));
+    const std::string number = reading.hasValue ? format("%.0f%%", percent) : "N/A";
+    const ImVec2 numberExtent = textSize(state.displayFont, numberSize, number);
+    drawHalloweenText(draw, state.displayFont, numberSize, ImVec2(center.x - numberExtent.x * 0.5f, center.y + radius * 0.80f - numberExtent.y * 0.5f),
+                      reading.hasValue ? kHwBone : kHwMist, number);
+    drawPlaque(draw, state.displayFont, 19.0f, center.x, center.y - radius - 10.0f, reading.label);
+
+    // Both readouts on one line under the dial, "4.32 GHz · VCORE 1.208 V".
+    const std::string readout = reading.line1.empty() ? reading.line2 : reading.line1 + "  ·  " + reading.line2;
+    const ImVec2 readoutExtent = textSize(state.textFont, 14.0f, readout);
+    drawHalloweenText(draw, state.textFont, 14.0f, ImVec2(center.x - readoutExtent.x * 0.5f, center.y + radius + 8.0f), kHwMist, readout, 1.0f);
+}
+
+void drawHalloweenGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    const DialLayout layout = dialLayout(box);
+    const float radius = std::floor(layout.radius * 0.84f);   // room for the plaque above and the readout below
+    for (int i = 0; i < 4; ++i) {
+        drawHalloweenGauge(draw, ImVec2(layout.centerX(box, i), layout.centerY + 4.0f), radius, readings[i], state, i);
+    }
+}
+
+// A stone panel with cobwebs in its top corners and the title on a plaque
+// sitting on its top edge. Returns the area for content.
+Box drawHalloweenPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    const Box slab{box.min + ImVec2(3.0f, 8.0f), box.max - ImVec2(3.0f, 3.0f)};
+    drawStoneSlab(draw, slab, 14.0f, 1.0f);
+    drawCobweb(draw, slab.min + ImVec2(4.0f, 4.0f), 34.0f, 1.0f, 1.0f, 0.55f);
+    drawCobweb(draw, ImVec2(slab.max.x - 4.0f, slab.min.y + 4.0f), 34.0f, -1.0f, 1.0f, 0.55f);
+    drawPlaque(draw, state.displayFont, 19.0f, std::floor((slab.min.x + slab.max.x) * 0.5f), box.min.y - 2.0f, title);
+    return Box{ImVec2(slab.min.x + 16.0f, slab.min.y + 26.0f), ImVec2(slab.max.x - 12.0f, slab.max.y - 12.0f)};
+}
+
+// "LABEL   value": a small orange label, the value in white.
+void drawHalloweenInfoRow(const HudState& state, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(state.textFont, 13.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);   // line the small label up with the taller value
+    ImGui::TextColored(kHwOrange, "%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// The cores as stone tiles that fill with goo from the bottom; the surface of
+// the goo ripples while animating.
+void drawHalloweenCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawHalloweenPanelFrame(draw, box, format("Cores (%zu threads)", state.cores.size()), state), "##HalloweenCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos() + ImVec2(2.0f, 2.0f);
+    const ImVec2 room = ImGui::GetContentRegionAvail() - ImVec2(4.0f, 4.0f);
+
+    constexpr float kGap = 9.0f, kMinWidth = 56.0f, kMinHeight = 34.0f, kMaxHeight = 52.0f;
+    const int count = static_cast<int>(state.cores.size());
+    const int columns = std::clamp(static_cast<int>((room.x + kGap) / (kMinWidth + kGap)), 1, std::max(count, 1));
+    const int rows = (count + columns - 1) / std::max(columns, 1);
+    const float cellWidth = std::floor((room.x - kGap * static_cast<float>(columns - 1)) / static_cast<float>(columns));
+    const float cellHeight = std::floor(std::clamp((room.y - kGap * static_cast<float>(rows - 1)) / static_cast<float>(std::max(rows, 1)), kMinHeight, kMaxHeight));
+
+    for (int i = 0; i < count; ++i) {
+        const ImVec2 a = start + ImVec2((cellWidth + kGap) * static_cast<float>(i % columns), (cellHeight + kGap) * static_cast<float>(i / columns));
+        const ImVec2 b = a + ImVec2(cellWidth, cellHeight);
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const ImVec4& color = halloweenLoadColor(value, 0.50f, 0.80f);
+
+        panel->AddRectFilled(a - ImVec2(2.5f, 2.5f), b + ImVec2(2.5f, 2.5f), withAlpha(kHwOutline, 1.0f), 9.0f);
+        panel->AddRectFilled(a, b, withAlpha(kHwPlaque, 1.0f), 7.0f);
+        const float surface = b.y - (cellHeight - 4.0f) * value / 100.0f - 2.0f;
+        if (value > 0.5f) {
+            panel->PushClipRect(a, b, true);
+            panel->AddRectFilled(ImVec2(a.x, surface + 2.0f), b, withAlpha(color, 1.0f), 7.0f, ImDrawFlags_RoundCornersBottom);
+            const float phase = state.animate ? state.time * 2.0f + static_cast<float>(i) : 0.0f;
+            for (float x = a.x + 3.0f; x < b.x; x += 7.0f) {   // ripples
+                panel->AddCircleFilled(ImVec2(x, surface + 2.0f + 1.5f * sinf(phase + x * 0.4f)), 3.5f, withAlpha(color, 1.0f));
+            }
+            panel->PopClipRect();
+        }
+        panel->AddLine(ImVec2(a.x + 6.0f, a.y + 2.0f), ImVec2(b.x - 6.0f, a.y + 2.0f), withAlpha(kHwStoneLit, 0.7f), 1.0f);
+
+        drawHalloweenText(panel, state.textFont, 12.0f, a + ImVec2(6.0f, 3.0f), kHwMist, format("C%02d", i), 1.0f);
+        const std::string text = format("%.0f%%", value);
+        const ImVec2 extent = textSize(state.displayFont, 19.0f, text);
+        drawHalloweenText(panel, state.displayFont, 19.0f, ImVec2(b.x - extent.x - 5.0f, b.y - extent.y + 1.0f), kHwBone, text, 1.5f);
+    }
+    ImGui::Dummy(ImVec2(room.x, (cellHeight + kGap) * static_cast<float>(rows)));
+    ImGui::EndChild();
+}
+
+// A flickering candle flame: a teardrop of orange with a yellow core.
+void drawCandleFlame(ImDrawList* draw, const ImVec2& base, float height, const HudState& state) {
+    const float flicker = state.animate ? 0.85f + 0.15f * sinf(state.time * 17.0f) * sinf(state.time * 5.0f) : 1.0f;
+    const float h = height * flicker, w = height * 0.38f;
+    for (const auto& [scale, color] : {std::pair{1.0f, kHwOrange}, std::pair{0.55f, kHwGlow}}) {
+        draw->AddCircleFilled(base + ImVec2(0.0f, -w * scale), w * scale, withAlpha(color, 1.0f));
+        draw->AddTriangleFilled(base + ImVec2(-w * scale * 0.95f, -w * scale), base + ImVec2(w * scale * 0.95f, -w * scale),
+                                base + ImVec2(0.0f, -h * scale), withAlpha(color, 1.0f));
+    }
+}
+
+// The spooky title, a candle-lit "LIVE", the clock and the gear; goo dripping
+// along the bottom. Returns the gear's rectangle.
+Box drawHalloweenHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 5.0f;
+    const ImVec2 titleExtent = textSize(state.displayFont, 34.0f, "VeeaStats");
+    drawHalloweenText(draw, state.displayFont, 34.0f, ImVec2(box.min.x, midY - titleExtent.y * 0.5f), kHwOrange, "VeeaStats", 2.5f);
+    const ImVec2 subtitleExtent = textSize(state.textFont, 13.0f, "Haunted Hardware");
+    drawHalloweenText(draw, state.textFont, 13.0f, ImVec2(box.min.x + titleExtent.x + 14.0f, midY - subtitleExtent.y * 0.5f + 3.0f), kHwMist,
+                      "Haunted Hardware", 1.0f);
+
+    const Box gear = drawHeaderGear(ui, box.max.x, midY);
+    float right = gear.min.x - 18.0f;
+
+    std::string clock, date;
+    currentClock(clock, date);
+    const ImVec2 clockExtent = textSize(state.displayFont, 26.0f, clock);
+    right -= clockExtent.x;
+    drawHalloweenText(draw, state.displayFont, 26.0f, ImVec2(right, midY - clockExtent.y * 0.5f), kHwBone, clock);
+    const ImVec2 dateExtent = textSize(state.textFont, 12.0f, date);
+    right -= dateExtent.x + 12.0f;
+    drawHalloweenText(draw, state.textFont, 12.0f, ImVec2(right, midY - dateExtent.y * 0.5f + 1.0f), kHwMist, date, 1.0f);
+
+    const ImVec2 liveExtent = textSize(state.textFont, 12.0f, "LIVE");
+    right -= liveExtent.x + 22.0f;
+    drawCandleFlame(draw, ImVec2(right - 6.0f, midY + 6.0f), 14.0f, state);
+    drawHalloweenText(draw, state.textFont, 12.0f, ImVec2(right + 4.0f, midY - liveExtent.y * 0.5f + 1.0f), kHwOrange, "LIVE", 1.0f);
+
+    drawGooBand(draw, Box{ImVec2(box.min.x, box.max.y - 7.0f), ImVec2(box.max.x, box.max.y - 1.0f)}, state);
+    return gear;
+}
+
+void applyHalloweenStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 4.0f);
+    style.ItemSpacing = ImVec2(8.0f, 5.0f);
+    style.WindowRounding = style.PopupRounding = 10.0f;
+    style.ChildRounding = 0.0f;
+    style.FrameRounding = 8.0f;
+    style.ScrollbarRounding = style.GrabRounding = 6.0f;
+    style.WindowBorderSize = style.PopupBorderSize = 2.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 10.0f;
+
+    ImVec4* colors = style.Colors;
+    auto orange = [](float alpha) { return ImVec4(kHwOrange.x, kHwOrange.y, kHwOrange.z, alpha); };
+    auto purple = [](float alpha) { return ImVec4(kHwPurple.x, kHwPurple.y, kHwPurple.z, alpha); };
+    colors[ImGuiCol_Text]                 = kHwBone;
+    colors[ImGuiCol_TextDisabled]         = kHwMist;
+    colors[ImGuiCol_WindowBg]             = ImVec4(0.20f, 0.19f, 0.25f, 0.98f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(0.20f, 0.19f, 0.25f, 0.98f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = ImVec4(0.08f, 0.05f, 0.11f, 1.0f);
+    colors[ImGuiCol_FrameBg]              = kHwPlaque;
+    colors[ImGuiCol_FrameBgHovered]       = purple(0.40f);
+    colors[ImGuiCol_FrameBgActive]        = purple(0.60f);
+    colors[ImGuiCol_Button]               = orange(0.80f);
+    colors[ImGuiCol_ButtonHovered]        = orange(0.95f);
+    colors[ImGuiCol_ButtonActive]         = kHwGlow;
+    colors[ImGuiCol_Header]               = orange(0.55f);
+    colors[ImGuiCol_HeaderHovered]        = orange(0.75f);
+    colors[ImGuiCol_HeaderActive]         = orange(0.90f);
+    colors[ImGuiCol_CheckMark]            = kHwOrange;
+    colors[ImGuiCol_Separator]            = ImVec4(kHwMist.x, kHwMist.y, kHwMist.z, 0.30f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = kHwStoneLit;
+    colors[ImGuiCol_ScrollbarGrabHovered] = orange(0.70f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = kHwOrange;
+    colors[ImGuiCol_TextSelectedBg]       = purple(0.40f);
+    colors[ImGuiCol_NavCursor]            = kHwOrange;
+}
+
+// ============================================================================
+// 7. SKIN SWITCHING
+// ============================================================================
+
+// Every font the skins use, added once at startup.
+struct UiFonts {
+    ImFont* classic{nullptr};           // ImGui's built-in ProggyClean, 13 px (the original look)
+    ImFont* jarvText{nullptr};          // Rajdhani
+    ImFont* jarvDisplay{nullptr};       // Orbitron
+    ImFont* galacticText{nullptr};      // Saira Semi Condensed
+    ImFont* galacticDisplay{nullptr};   // Michroma
+    ImFont* gunshipText{nullptr};       // Tiny5: crisp at multiples of 8 px
+    ImFont* gunshipDisplay{nullptr};    // Press Start 2P: also crisp at multiples of 8 px
+    ImFont* halloweenText{nullptr};     // Fredoka SemiBold
+    ImFont* halloweenDisplay{nullptr};  // Henny Penny
+};
+
+UiFonts loadFonts() {
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    UiFonts fonts;
+    fonts.classic         = atlas->AddFontDefaultBitmap();
+    fonts.jarvText        = atlas->AddFontFromMemoryCompressedBase85TTF(RajdhaniSemiBold_compressed_data_base85, 17.0f);
+    fonts.jarvDisplay     = atlas->AddFontFromMemoryCompressedBase85TTF(OrbitronSemiBold_compressed_data_base85, 13.0f);
+    fonts.galacticText    = atlas->AddFontFromMemoryCompressedBase85TTF(SairaSemiCondensedMedium_compressed_data_base85, 16.0f);
+    fonts.galacticDisplay = atlas->AddFontFromMemoryCompressedBase85TTF(MichromaRegular_compressed_data_base85, 13.0f);
+
+    // Pixel fonts: no oversampling and whole-pixel positions keep their edges sharp.
+    ImFontConfig pixel;
+    pixel.OversampleH = pixel.OversampleV = 1;
+    pixel.PixelSnapH = true;
+    fonts.gunshipText    = atlas->AddFontFromMemoryCompressedBase85TTF(Tiny5Regular_compressed_data_base85, 16.0f, &pixel);
+    fonts.gunshipDisplay = atlas->AddFontFromMemoryCompressedBase85TTF(PressStart2PRegular_compressed_data_base85, 16.0f, &pixel);
+
+    fonts.halloweenText    = atlas->AddFontFromMemoryCompressedBase85TTF(FredokaSemiBold_compressed_data_base85, 16.0f);
+    fonts.halloweenDisplay = atlas->AddFontFromMemoryCompressedBase85TTF(HennyPennyRegular_compressed_data_base85, 18.0f);
+    return fonts;
+}
+
+// Every HUD skin, ready to draw (see section 6).
+struct HudSkins {
+    HudSkin jarv, galactic, gunship, halloween;
+
+    const HudSkin& forSkin(Skin skin) const {
+        switch (skin) {
+            case Skin::Galactic:  return galactic;
+            case Skin::Gunship:   return gunship;
+            case Skin::Halloween: return halloween;
+            default:              return jarv;
+        }
+    }
+};
+
+HudSkins makeHudSkins(const UiFonts& fonts) {
+    HudSkins skins;
+    skins.jarv = {fonts.jarvText, fonts.jarvDisplay, 10.0f, {64.0f, 96.0f, 76.0f}, drawJarvBackground, drawJarvHeader,
+                  drawJarvGauges, drawJarvPanelFrame, drawJarvCores, drawJarvInfoRow, applyJarvStyle};
+    skins.galactic = {fonts.galacticText, fonts.galacticDisplay, 9.0f, {}, drawGalacticBackground, drawGalacticHeader,
+                      drawGalacticGauges, drawGalacticPanelFrame, drawGalacticCores, drawGalacticInfoRow, applyGalacticStyle};
+    skins.gunship = {fonts.gunshipText, fonts.gunshipDisplay, 8.0f, {}, drawGunshipBackground, drawGunshipHeader,
+                     drawGunshipGauges, drawGunshipPanelFrame, drawGunshipCores, drawGunshipInfoRow, applyGunshipStyle};
+    skins.halloween = {fonts.halloweenText, fonts.halloweenDisplay, 13.0f, {}, drawHalloweenBackground, drawHalloweenHeader,
+                       drawHalloweenGauges, drawHalloweenPanelFrame, drawHalloweenCores, drawHalloweenInfoRow, applyHalloweenStyle,
+                       fonts.halloweenText};
+    return skins;
+}
+
+// Switches ImGui's colours, spacing and default font to the given skin.
+// Called between frames, never in the middle of one.
+void applySkin(Skin skin, const UiFonts& fonts) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();   // start from the defaults so nothing carries over from the previous skin
+    ImGui::StyleColorsDark();
+    ImFont* font = fonts.classic;
+    switch (skin) {
+        case Skin::Classic:  break;
+        case Skin::Jarv:     applyJarvStyle(style);     font = fonts.jarvText;     break;
+        case Skin::Galactic: applyGalacticStyle(style); font = fonts.galacticText; break;
+        case Skin::Gunship:  applyGunshipStyle(style);  font = fonts.gunshipText;  break;
+        case Skin::Halloween: applyHalloweenStyle(style); font = fonts.halloweenText; break;
+    }
+    ImGui::GetIO().FontDefault = font;
+}
+
+// Draws the whole window in the chosen skin.
+void drawWindow(const ImVec2& size, UiState& ui, const HudSkins& hudSkins, HudState& hud, const StaticInfo& info,
+                const LiveStats& live) {
+    if (ui.settings.skin == Skin::Classic) drawDashboard(size, ui, info, live);
+    else                                   drawHudDashboard(size, ui, hudSkins.forSkin(ui.settings.skin), hud, info, live);
+}
+
+void onGlfwError(int error, const char* description) {
+    fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
+// The main loop sleeps between updates and should only wake early when the
+// user does something. Waking early is not proof of that on its own: Wayland
+// also wakes the program with housekeeping messages after every frame. So these
+// callbacks flag real input (mouse, keyboard, resize, focus, redraw requests)
+// in the bool that watchForInput() is given.
+void markInput(GLFWwindow* window) {
+    *static_cast<bool*>(glfwGetWindowUserPointer(window)) = true;
+}
+
+// Must be called before ImGui installs its own callbacks, which then pass every
+// event on to these.
+void watchForInput(GLFWwindow* window, bool* inputArrived) {
+    glfwSetWindowUserPointer(window, inputArrived);
+    glfwSetCursorPosCallback(window, [](GLFWwindow* w, double, double) { markInput(w); });
+    glfwSetCursorEnterCallback(window, [](GLFWwindow* w, int) { markInput(w); });
+    glfwSetMouseButtonCallback(window, [](GLFWwindow* w, int, int, int) { markInput(w); });
+    glfwSetScrollCallback(window, [](GLFWwindow* w, double, double) { markInput(w); });
+    glfwSetKeyCallback(window, [](GLFWwindow* w, int, int, int, int) { markInput(w); });
+    glfwSetCharCallback(window, [](GLFWwindow* w, unsigned int) { markInput(w); });
+    glfwSetWindowFocusCallback(window, [](GLFWwindow* w, int) { markInput(w); });
+    glfwSetFramebufferSizeCallback(window, [](GLFWwindow* w, int, int) { markInput(w); });
+    glfwSetWindowRefreshCallback(window, [](GLFWwindow* w) { markInput(w); });
+    glfwSetWindowIconifyCallback(window, [](GLFWwindow* w, int) { markInput(w); });
+}
+
 // ============================================================================
 // 8. OVERLAY, HOTKEY AND BACKGROUND MODE
 // ============================================================================

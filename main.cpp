@@ -1,3 +1,1480 @@
+// VeeaStats - a small Linux hardware monitor built with Dear ImGui + GLFW + OpenGL.
+//
+// How this file is organised:
+//   1. Helpers         - reading files, parsing numbers, formatting text
+//   2. Data types      - plain structs that hold what we display
+//   3. Static info     - read ONCE at startup (CPU name, drives, OS, ...)
+//   4. Live stats      - re-read every update interval (CPU load, RAM, GPU, ...)
+//   5. UI              - settings, shared widgets and the Classic skin
+//   6. HUD skins       - JARV, Galactic Conflict, Federation Gunship and
+//                        Halloween: one shared layout, each skin drawing it its own way
+//   7. Skin switching  - fonts, styles and picking which skin draws the window
+//   8. Overlay         - the Ctrl+Shift+O in-game overlay, its hotkey, and
+//                        running in the background
+//   9. main()          - window setup and the main loop
+//
+// Everything is read straight from /proc and /sys (no shell commands in the
+// refresh loop), so it works the same on any Linux distro and costs almost
+// nothing to run.
+
+// Optional: build with -DIMGUI_IMPL_OPENGL_ES3 for devices that only have
+// OpenGL ES (some ARM handhelds). Desktop OpenGL is the default.
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+#define GLFW_INCLUDE_ES3
+#endif
+
+#define IMGUI_DEFINE_MATH_OPERATORS   // lets ImVec2 values be added and subtracted with + and -
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include <GLFW/glfw3.h>
+
+// The overlay is an X11 window (see section 8). Only headers here: libX11 and
+// GLib are loaded at runtime, so they aren't needed to start the program.
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3native.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <gio/gio.h>
+
+// Fonts for the HUD skins, embedded so nothing needs installing (SIL Open Font
+// License; see fonts/). Trimmed to Western European characters to keep them small.
+#include "fonts/fredoka_semibold.h"
+#include "fonts/hennypenny_regular.h"
+#include "fonts/michroma_regular.h"
+#include "fonts/orbitron_semibold.h"
+#include "fonts/pressstart2p_regular.h"
+#include "fonts/rajdhani_semibold.h"
+#include "fonts/saira_semicondensed_medium.h"
+#include "fonts/tiny5_regular.h"
+
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/sysinfo.h>
+#include <sys/un.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <cfloat>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+extern char** environ;
+
+namespace fs = std::filesystem;
+
+namespace {
+
+// ============================================================================
+// 1. HELPERS
+// ============================================================================
+
+// How often live stats update, chosen from the dropdown at the top of the window.
+// 250 ms is the lowest on offer: below that the monitor itself starts using
+// noticeable CPU on small devices, and the kernel's CPU counters only tick every
+// 10 ms, so shorter intervals would just make the CPU bars jumpy.
+constexpr int kDefaultRefreshMs = 500;
+constexpr int kRefreshChoicesMs[] = {250, 500, 750, 1000, 1250, 1500, 1750, 2000};
+
+constexpr float kPi = 3.14159265f;
+
+constexpr double kAnimationFrameSeconds = 1.0 / 30.0;   // frame time while a skin animates
+
+// CPU voltage is read less often than everything else. On desktop boards it
+// comes from a motherboard sensor chip, and each fresh reading costs the kernel
+// 30-50 ms on a slow bus - most of this program's CPU use if done every refresh.
+// The trade-off: the VCore figure lags up to this long behind.
+constexpr double kVoltageReadIntervalMs = 5000.0;
+
+constexpr double kBytesPerGb     = 1024.0 * 1024.0 * 1024.0;
+constexpr double kKbPerGb        = 1024.0 * 1024.0;
+
+constexpr bool kKeepGoing = true;   // return values for the line callbacks below
+constexpr bool kStop      = false;
+
+constexpr const char* kAmdVendorId    = "0x1002";   // PCI vendor ids as shown in sysfs
+constexpr const char* kNvidiaVendorId = "0x10de";
+constexpr const char* kIntelVendorId  = "0x8086";
+
+// printf that returns a std::string.
+__attribute__((format(printf, 1, 2)))
+std::string format(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    va_list argsCopy;
+    va_copy(argsCopy, args);
+    const int length = vsnprintf(nullptr, 0, fmt, argsCopy);
+    va_end(argsCopy);
+
+    std::string result;
+    if (length > 0) {
+        result.resize(static_cast<size_t>(length));
+        vsnprintf(&result[0], static_cast<size_t>(length) + 1, fmt, args);
+    }
+    va_end(args);
+    return result;
+}
+
+bool startsWith(std::string_view text, std::string_view prefix) {
+    return text.substr(0, prefix.size()) == prefix;
+}
+
+// Removes spaces, tabs, newlines and double quotes from both ends.
+// (Quotes are stripped so values like PRETTY_NAME="Arch Linux" come out clean.)
+std::string trim(std::string_view text) {
+    constexpr const char* kJunk = " \t\r\n\"";
+    const size_t first = text.find_first_not_of(kJunk);
+    if (first == std::string_view::npos) return "";
+    const size_t last = text.find_last_not_of(kJunk);
+    return std::string(text.substr(first, last - first + 1));
+}
+
+// For lines like "model name : Intel(R) Core(TM) i7" returns the part after ':'.
+std::string valueAfterColon(std::string_view line) {
+    const size_t colon = line.find(':');
+    return colon == std::string_view::npos ? "" : trim(line.substr(colon + 1));
+}
+
+bool fileExists(const std::string& path) {
+    return access(path.c_str(), F_OK) == 0;
+}
+
+// True if `name` is an executable somewhere on $PATH (replaces `which`).
+bool commandExists(const char* name) {
+    const char* pathEnv = getenv("PATH");
+    if (!pathEnv) return false;
+
+    std::string_view dirs(pathEnv);
+    while (!dirs.empty()) {
+        const size_t colon = dirs.find(':');
+        const std::string dir(dirs.substr(0, colon));
+        if (!dir.empty() && access((dir + "/" + name).c_str(), X_OK) == 0) return true;
+        if (colon == std::string_view::npos) break;
+        dirs.remove_prefix(colon + 1);
+    }
+    return false;
+}
+
+// Calls onLine(const char* line) for every line of an open stream (newline removed).
+// The callback returns kKeepGoing to continue or kStop to stop early.
+template <typename Callback>
+void forEachLineIn(FILE* stream, Callback onLine) {
+    char* buffer = nullptr;
+    size_t capacity = 0;
+    ssize_t length;
+    while ((length = getline(&buffer, &capacity, stream)) != -1) {
+        if (length > 0 && buffer[length - 1] == '\n') buffer[length - 1] = '\0';
+        if (onLine(static_cast<const char*>(buffer)) == kStop) break;
+    }
+    free(buffer);
+}
+
+// Same, for a file path. Returns false if the file could not be opened.
+template <typename Callback>
+bool forEachLine(const std::string& path, Callback onLine) {
+    FILE* file = fopen(path.c_str(), "r");
+    if (!file) return false;
+    forEachLineIn(file, onLine);
+    fclose(file);
+    return true;
+}
+
+// Same, for the output of a shell command. Only used for the two things that
+// have no file-based alternative (RAM module details and rpm package counts),
+// and only once at startup.
+template <typename Callback>
+void forEachCommandLine(const char* command, Callback onLine) {
+    FILE* pipe = popen(command, "r");
+    if (!pipe) return;
+    forEachLineIn(pipe, onLine);
+    pclose(pipe);
+}
+
+// First line of a (small) file such as a sysfs entry, trimmed. "" if unreadable.
+std::string readFirstLine(const std::string& path) {
+    std::string result;
+    forEachLine(path, [&](const char* line) {
+        result = trim(line);
+        return kStop;
+    });
+    return result;
+}
+
+// Parses a number from text. Returns false for things like "" or "[N/A]".
+bool parseNumber(const std::string& text, double& out) {
+    if (text.empty()) return false;
+    char* end = nullptr;
+    const double value = strtod(text.c_str(), &end);
+    if (end == text.c_str()) return false;
+    out = value;
+    return true;
+}
+
+bool readNumber(const std::string& path, double& out) {
+    return parseNumber(readFirstLine(path), out);
+}
+
+// Sorted directory listing. Never throws: a missing or unreadable folder
+// simply gives an empty list.
+std::vector<fs::path> listDirectory(const std::string& path) {
+    std::vector<fs::path> entries;
+    std::error_code error;
+    for (fs::directory_iterator it(path, error); !error && it != fs::directory_iterator(); it.increment(error)) {
+        entries.push_back(it->path());
+    }
+    std::sort(entries.begin(), entries.end());
+    return entries;
+}
+
+int countSubdirectories(const std::string& path) {
+    int count = 0;
+    for (const fs::path& entry : listDirectory(path)) {
+        std::error_code error;
+        if (fs::is_directory(entry, error)) ++count;
+    }
+    return count;
+}
+
+// The paths from the list that exist, in the same order. Used when the same
+// value lives in different files depending on the driver or kernel version.
+std::vector<std::string> existingPaths(const std::vector<std::string>& candidates) {
+    std::vector<std::string> found;
+    for (const std::string& path : candidates) {
+        if (fileExists(path)) found.push_back(path);
+    }
+    return found;
+}
+
+// The first path from the list that exists, or "" if none do.
+std::string firstExisting(const std::vector<std::string>& candidates) {
+    const std::vector<std::string> found = existingPaths(candidates);
+    return found.empty() ? "" : found.front();
+}
+
+// Reads a voltage sensor file (millivolts) and returns volts. Returns 0 if the
+// file is missing or holds an implausible number (some sensors report junk).
+double readVoltage(const std::string& path) {
+    double millivolts = 0.0;
+    if (path.empty() || !readNumber(path, millivolts)) return 0.0;
+    return (millivolts > 100.0 && millivolts < 2500.0) ? millivolts / 1000.0 : 0.0;
+}
+
+// Milliseconds on a clock that never jumps backwards (for measuring intervals).
+double monotonicMs() {
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<double>(now.tv_sec) * 1000.0 + static_cast<double>(now.tv_nsec) / 1e6;
+}
+
+// Device-tree files such as "compatible" hold several strings separated by NUL
+// bytes (e.g. "rockchip,rk3568-mali" NUL "arm,mali-bifrost"). Returns them as a list.
+std::vector<std::string> readNulSeparatedStrings(const std::string& path) {
+    std::vector<std::string> parts;
+    FILE* file = fopen(path.c_str(), "rb");
+    if (!file) return parts;
+    char buffer[512];
+    const size_t length = fread(buffer, 1, sizeof(buffer), file);
+    fclose(file);
+
+    size_t start = 0;
+    for (size_t i = 0; i <= length; ++i) {
+        if (i == length || buffer[i] == '\0') {
+            if (i > start) parts.emplace_back(buffer + start, i - start);
+            start = i + 1;
+        }
+    }
+    return parts;
+}
+
+// ============================================================================
+// 2. DATA TYPES
+// ============================================================================
+
+enum class GpuVendor { Unknown, Nvidia, Amd, Intel, Mali };
+
+// Cumulative CPU time counters (in "jiffies") for one core, from /proc/stat.
+struct CpuTimes {
+    unsigned long long active{0};
+    unsigned long long total{0};
+};
+
+struct RamStats {
+    double totalGb{0.0};
+    double usedGb{0.0};
+    float percent{0.0f};
+};
+
+// What we know about the GPU right now. Different GPUs report different things,
+// so the has... flags say which numbers are real, and the notes explain to the
+// user why a bar is missing.
+struct GpuStats {
+    GpuVendor vendor{GpuVendor::Unknown};
+    std::string name{"Unknown GPU"};
+    float gpuUsage{0.0f};
+    float vramUsage{0.0f};
+    double vramUsedGb{0.0};
+    double vramTotalGb{0.0};
+    double clockGhz{0.0};
+    double voltageV{0.0};
+    bool hasLoad{false};          // gpuUsage is valid
+    bool loadIsEstimate{false};   // ...but only approximate (Intel)
+    bool hasMemory{false};        // the vram... numbers are valid
+    std::string loadNote;         // shown instead of the load bar when hasLoad is false
+    std::string memoryNote;       // shown instead of the VRAM bar when hasMemory is false
+};
+
+struct DriveInfo {
+    std::string deviceName;
+    std::string model;
+    double sizeGb{0.0};
+    std::string type;   // NVMe SSD, SSD, HDD, SD/eMMC
+};
+
+struct MotherboardInfo {
+    std::string name{"Unknown Motherboard"};
+    std::string chipset{"Unknown Chipset"};
+};
+
+struct SystemInfo {
+    std::string osName;
+    std::string kernel;
+    std::string packages;
+    std::string shell;
+};
+
+// Things that never change while the program runs.
+struct StaticInfo {
+    std::string cpuModel;
+    MotherboardInfo board;
+    std::vector<DriveInfo> drives;
+    std::vector<std::string> ramModules;   // ready-to-display text, one per DIMM
+    SystemInfo os;
+};
+
+// Things that are re-read every refresh.
+struct LiveStats {
+    std::vector<float> cpuPercent;   // one entry per core
+    double cpuFreqGhz{0.0};
+    double cpuVoltage{0.0};
+    RamStats ram;
+    GpuStats gpu;
+    std::string uptime{"N/A"};
+};
+
+// Load across all cores, 0-100.
+float averageCpuPercent(const LiveStats& live) {
+    if (live.cpuPercent.empty()) return 0.0f;
+    float total = 0.0f;
+    for (const float percent : live.cpuPercent) total += percent;
+    return total / static_cast<float>(live.cpuPercent.size());
+}
+
+// ============================================================================
+// 3. STATIC INFO (read once at startup)
+// ============================================================================
+
+// ---- CPU -------------------------------------------------------------------
+
+std::string readCpuModelName() {
+    // x86 uses "model name". Many ARM kernels only provide "Hardware" or "Processor".
+    std::string modelName, fallback;
+    forEachLine("/proc/cpuinfo", [&](const char* line) {
+        if (startsWith(line, "model name")) {
+            modelName = valueAfterColon(line);
+            return kStop;
+        }
+        if (fallback.empty() && (startsWith(line, "Hardware") || startsWith(line, "Processor"))) {
+            fallback = valueAfterColon(line);
+        }
+        return kKeepGoing;
+    });
+    if (!modelName.empty()) return modelName;
+    if (!fallback.empty()) return fallback;
+    return "CPU Monitor";
+}
+
+// ---- Motherboard -----------------------------------------------------------
+
+// Linux has no "chipset model" file, but retail board names almost always contain
+// it ("PRIME B650M-A", "MAG Z790 TOMAHAWK", "TRX50 AERO D"). Returns e.g. "B650",
+// "X670E", or "" if no word in the name looks like a chipset.
+std::string chipsetFromBoardName(const std::string& boardName) {
+    static const char* const kPrefixes[] = {"TRX", "WRX", "A", "B", "H", "Q", "X", "Z", "W"};
+
+    std::string token;
+    auto checkToken = [&]() -> std::string {
+        for (const char* prefix : kPrefixes) {
+            if (!startsWith(token, prefix)) continue;
+            size_t pos = std::strlen(prefix);
+            const size_t digitsStart = pos;
+            while (pos < token.size() && std::isdigit(static_cast<unsigned char>(token[pos]))) ++pos;
+            const size_t digitCount = pos - digitsStart;
+            if (digitCount < 2 || digitCount > 3) continue;
+
+            // "E" is part of the chipset (X670E); a single trailing letter after
+            // that is a form factor (B650M = micro-ATX, B650I = mini-ITX).
+            if (pos < token.size() && token[pos] == 'E') ++pos;
+            const size_t chipsetEnd = pos;
+            const size_t rest = token.size() - pos;
+            if (rest > 1 || (rest == 1 && !std::isalpha(static_cast<unsigned char>(token[pos])))) {
+                continue;
+            }
+            return token.substr(0, chipsetEnd);
+        }
+        return "";
+    };
+
+    for (size_t i = 0; i <= boardName.size(); ++i) {
+        const char c = i < boardName.size() ? boardName[i] : ' ';
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            token += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            continue;
+        }
+        if (!token.empty()) {
+            std::string chipset = checkToken();
+            if (!chipset.empty()) return chipset;
+            token.clear();
+        }
+    }
+    return "";
+}
+
+// "AMD" / "Intel" from the PCI host bridge, so the chipset reads "AMD B650".
+std::string platformVendor() {
+    for (const fs::path& device : listDirectory("/sys/bus/pci/devices")) {
+        if (!startsWith(readFirstLine(device.string() + "/class"), "0x0600")) continue;
+        const std::string pciVendor = readFirstLine(device.string() + "/vendor");
+        if (pciVendor == "0x1022") return "AMD";
+        if (pciVendor == "0x8086") return "Intel";
+    }
+    return "";
+}
+
+// Fallback when the board name doesn't help: some chipset families can be
+// recognised by their PCI IDs (only the family, e.g. B650 and X670 share IDs).
+std::string chipsetFamilyFromPci() {
+    for (const fs::path& device : listDirectory("/sys/bus/pci/devices")) {
+        if (readFirstLine(device.string() + "/vendor") != "0x1022") continue;
+        const std::string pciDevice = readFirstLine(device.string() + "/device");
+        if (pciDevice == "0x43f6" || pciDevice == "0x43f7") return "AMD 600/800 Series";
+        if (pciDevice == "0x43eb" || pciDevice == "0x43ee") return "AMD 500 Series";
+    }
+    return "";
+}
+
+MotherboardInfo readMotherboardInfo() {
+    MotherboardInfo board;
+    const std::string vendor  = readFirstLine("/sys/class/dmi/id/board_vendor");
+    const std::string product = readFirstLine("/sys/class/dmi/id/board_name");
+
+    if (!vendor.empty() || !product.empty()) {
+        board.name = trim(vendor + " " + product);
+    } else {
+        // ARM boards have no DMI table; the device tree holds the board name instead.
+        const std::string deviceTreeModel = readFirstLine("/sys/firmware/devicetree/base/model");
+        if (!deviceTreeModel.empty()) board.name = deviceTreeModel;
+    }
+
+    const std::string chipset = chipsetFromBoardName(product);
+    if (!chipset.empty()) {
+        board.chipset = trim(platformVendor() + " " + chipset);
+        return board;
+    }
+
+    const std::string family = chipsetFamilyFromPci();
+    if (!family.empty()) {
+        board.chipset = family;
+        return board;
+    }
+
+    // Unknown chipset: describe the PCI host/ISA bridge instead.
+    for (const fs::path& device : listDirectory("/sys/bus/pci/devices")) {
+        const std::string classCode = readFirstLine(device.string() + "/class");
+        if (startsWith(classCode, "0x0600") || startsWith(classCode, "0x0601")) {
+            const std::string pciVendor = readFirstLine(device.string() + "/vendor");
+            const std::string pciDevice = readFirstLine(device.string() + "/device");
+            if (!pciVendor.empty() && !pciDevice.empty()) {
+                board.chipset = "PCI Host/ISA Bridge [" + pciVendor + ":" + pciDevice + "]";
+                break;
+            }
+        }
+    }
+    return board;
+}
+
+// ---- Storage ---------------------------------------------------------------
+
+std::vector<DriveInfo> readStorageDrives() {
+    static const char* const kIgnoredPrefixes[] = {"loop", "ram", "zram", "sr"};
+
+    std::vector<DriveInfo> drives;
+    for (const fs::path& entry : listDirectory("/sys/block")) {
+        const std::string name = entry.filename().string();
+        const std::string dir  = entry.string();
+
+        bool ignored = false;
+        for (const char* prefix : kIgnoredPrefixes) {
+            if (startsWith(name, prefix)) ignored = true;
+        }
+        // SD/eMMC cards expose hidden helper devices (mmcblk0boot0, mmcblk0rpmb).
+        if (startsWith(name, "mmcblk") && (name.find("boot") != std::string::npos ||
+                                           name.find("rpmb") != std::string::npos)) {
+            ignored = true;
+        }
+        if (ignored) continue;
+
+        const bool isNvme = startsWith(name, "nvme");
+        const bool isSdOrEmmc = startsWith(name, "mmcblk");
+
+        // SATA/USB disks have "model"; NVMe and SD/eMMC devices use "name".
+        std::string model = readFirstLine(dir + "/device/model");
+        if (model.empty()) model = readFirstLine(dir + "/device/name");
+        if (model.empty()) {
+            if (!isNvme) continue;
+            model = "NVMe Storage Device";
+        }
+
+        double sectors = 0.0;   // sysfs always counts in 512-byte sectors
+        if (!readNumber(dir + "/size", sectors)) continue;
+        const double sizeGb = sectors * 512.0 / kBytesPerGb;
+        if (sizeGb <= 0.0) continue;
+
+        std::string type = "SSD";
+        if (isNvme)                                           type = "NVMe SSD";
+        else if (isSdOrEmmc)                                  type = "SD/eMMC";
+        else if (readFirstLine(dir + "/queue/rotational") == "1") type = "HDD";
+
+        drives.push_back({name, model, sizeGb, type});
+    }
+    return drives;
+}
+
+// ---- RAM modules -----------------------------------------------------------
+
+struct RamModule {
+    std::string manufacturer, partNumber, size, speed;
+};
+
+std::string describeRamModule(size_t index, const RamModule& module) {
+    std::string label = "DIMM " + std::to_string(index + 1) + ": ";
+    if (!module.manufacturer.empty() && module.manufacturer != "Unknown") {
+        label += module.manufacturer + " ";
+    }
+    label += module.partNumber;
+    if (!module.size.empty() || !module.speed.empty()) {
+        label += " (" + module.size + (module.speed.empty() ? "" : " @ " + module.speed) + ")";
+    }
+    return label;
+}
+
+// DIMM details live in the BIOS tables, which only root can read, so this needs
+// dmidecode run as root (or via passwordless sudo). If that isn't possible the
+// UI just shows "Standard System RAM".
+std::vector<std::string> readRamModuleLabels() {
+    const char* command = (geteuid() == 0) ? "dmidecode -t memory 2>/dev/null"
+                                           : "sudo -n dmidecode -t memory 2>/dev/null";
+    std::vector<RamModule> modules;
+    RamModule current;
+    bool inDevice = false;
+
+    auto finishDevice = [&]() {
+        const bool empty = current.partNumber.empty() || current.partNumber == "NO DIMM" ||
+                           startsWith(current.size, "No Module");
+        if (inDevice && !empty) modules.push_back(current);
+        current = RamModule();
+    };
+
+    forEachCommandLine(command, [&](const char* line) {
+        const std::string text = trim(line);
+        if (text == "Memory Device") {
+            finishDevice();
+            inDevice = true;
+        } else if (inDevice) {
+            if (startsWith(text, "Manufacturer:"))      current.manufacturer = valueAfterColon(text);
+            else if (startsWith(text, "Part Number:"))  current.partNumber = valueAfterColon(text);
+            else if (startsWith(text, "Size:"))         current.size = valueAfterColon(text);
+            else if (startsWith(text, "Speed:"))        current.speed = valueAfterColon(text);   // "Configured Memory Speed:" is deliberately not matched
+        }
+        return kKeepGoing;
+    });
+    finishDevice();
+
+    std::vector<std::string> labels;
+    for (size_t i = 0; i < modules.size(); ++i) labels.push_back(describeRamModule(i, modules[i]));
+
+    if (labels.empty()) {
+        // Fallback: ECC-capable systems expose DIMM labels through the EDAC driver.
+        for (const fs::path& controller : listDirectory("/sys/devices/system/edac/mc")) {
+            for (const fs::path& dimm : listDirectory(controller.string())) {
+                const std::string label = readFirstLine(dimm.string() + "/dimm_label");
+                if (!label.empty()) labels.push_back(describeRamModule(labels.size(), {"Generic", label, "", ""}));
+            }
+        }
+    }
+    return labels;
+}
+
+// ---- Operating system ------------------------------------------------------
+
+std::string readOsName() {
+    for (const char* path : {"/etc/os-release", "/usr/lib/os-release"}) {
+        std::string name;
+        forEachLine(path, [&](const char* line) {
+            if (startsWith(line, "PRETTY_NAME=")) {
+                name = trim(line + strlen("PRETTY_NAME="));
+                return kStop;
+            }
+            return kKeepGoing;
+        });
+        if (!name.empty()) return name;
+    }
+    return "Linux System";
+}
+
+std::string readKernelVersion() {
+    utsname info;
+    if (uname(&info) == 0) return std::string(info.sysname) + " " + info.release;
+    return "Linux Kernel";
+}
+
+std::string readShellName() {
+    const char* shell = getenv("SHELL");
+    if (!shell || !*shell) return "Unknown Shell";
+    const char* lastSlash = strrchr(shell, '/');
+    return lastSlash ? lastSlash + 1 : shell;
+}
+
+// ---- Package counts --------------------------------------------------------
+// Counted by looking at each package manager's database directly. This is
+// instant, unlike running the package manager itself (which can take seconds).
+// To support another package manager: write a countXxx() function and add it
+// to the table in readPackageSummary().
+
+int countPacman() {
+    return countSubdirectories("/var/lib/pacman/local");   // one folder per installed package
+}
+
+int countDpkg() {
+    int count = 0;
+    forEachLine("/var/lib/dpkg/status", [&](const char* line) {
+        if (strcmp(line, "Status: install ok installed") == 0) ++count;
+        return kKeepGoing;
+    });
+    return count;
+}
+
+int countRpm() {
+    // The rpm database is a binary format, so ask rpm itself.
+    if (!commandExists("rpm")) return 0;
+    int count = 0;
+    forEachCommandLine("rpm -qa 2>/dev/null", [&](const char*) {
+        ++count;
+        return kKeepGoing;
+    });
+    return count;
+}
+
+int countFlatpak() {
+    // Counts installed apps (not runtimes), system-wide and per-user.
+    int count = countSubdirectories("/var/lib/flatpak/app");   // note: only app *ids*, not arch/branch
+    const char* dataHome = getenv("XDG_DATA_HOME");
+    const char* home = getenv("HOME");
+    if (dataHome && *dataHome)  count += countSubdirectories(std::string(dataHome) + "/flatpak/app");
+    else if (home && *home)     count += countSubdirectories(std::string(home) + "/.local/share/flatpak/app");
+    return count;
+}
+
+int countSnap() {
+    // Every installed snap is mounted as a folder under /snap (plus a "bin" helper folder).
+    for (const char* root : {"/snap", "/var/lib/snapd/snap"}) {
+        const int folders = countSubdirectories(root);
+        if (folders > 0) return folders - (fileExists(std::string(root) + "/bin") ? 1 : 0);
+    }
+    return 0;
+}
+
+std::string readPackageSummary() {
+    struct PackageSource {
+        const char* name;
+        int (*count)();
+    };
+    static const PackageSource kSources[] = {
+        {"dpkg", countDpkg}, {"pacman", countPacman}, {"rpm", countRpm},
+        {"flatpak", countFlatpak}, {"snap", countSnap},
+    };
+
+    std::string summary;
+    for (const PackageSource& source : kSources) {
+        const int count = source.count();
+        if (count <= 0) continue;
+        if (!summary.empty()) summary += ", ";
+        summary += format("%d (%s)", count, source.name);
+    }
+    return summary.empty() ? "N/A" : summary;
+}
+
+StaticInfo readStaticInfo() {
+    StaticInfo info;
+    info.cpuModel   = readCpuModelName();
+    info.board      = readMotherboardInfo();
+    info.drives     = readStorageDrives();
+    info.ramModules = readRamModuleLabels();
+    info.os = {readOsName(), readKernelVersion(), readPackageSummary(), readShellName()};
+    return info;
+}
+
+// ============================================================================
+// 4. LIVE STATS (re-read every refresh)
+// ============================================================================
+
+// ---- CPU -------------------------------------------------------------------
+
+std::vector<CpuTimes> readCpuTimes() {
+    std::vector<CpuTimes> cores;
+    forEachLine("/proc/stat", [&](const char* line) {
+        // The per-core lines come first: "cpu0 ...", "cpu1 ...". The very first
+        // line, "cpu  ...", is the all-core total, which we skip.
+        if (!startsWith(line, "cpu")) return kStop;   // past the CPU lines (and their long "intr" neighbour)
+        if (!isdigit(static_cast<unsigned char>(line[3]))) return kKeepGoing;
+
+        unsigned long long user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
+        sscanf(line, "cpu%*u %llu %llu %llu %llu %llu %llu %llu %llu",
+               &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+
+        CpuTimes times;
+        times.active = user + nice + system + irq + softirq + steal;
+        times.total  = times.active + idle + iowait;   // guest time is already counted inside user/nice
+        cores.push_back(times);
+        return kKeepGoing;
+    });
+    return cores;
+}
+
+double readCpuFreqGhz() {
+    double khz = 0.0;
+    if (readNumber("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", khz) && khz > 0.0) {
+        return khz / 1e6;
+    }
+
+    // Fallback for systems without cpufreq: the first "cpu MHz" line in /proc/cpuinfo.
+    double mhz = 0.0;
+    forEachLine("/proc/cpuinfo", [&](const char* line) {
+        if (!startsWith(line, "cpu MHz")) return kKeepGoing;
+        mhz = strtod(valueAfterColon(line).c_str(), nullptr);
+        return kStop;
+    });
+    return mhz / 1000.0;
+}
+
+// Finds the sensor files that might report CPU core voltage, best guess first.
+// Done once at startup so each refresh only reads a couple of tiny files.
+//   1. Any voltage whose label names the CPU core (zenpower "SVI2_Core",
+//      asus-ec-sensors "CPU Core", ...).
+//   2. in0 of a motherboard Super I/O chip (Nuvoton "nct6799", ITE "it8686",
+//      ...). Boards wire in0 to Vcore; Ryzen 7000+ CPUs report no voltage of
+//      their own, so on those this is the only source.
+//   3. Unlabelled inputs of CPU sensors.
+std::vector<std::string> findCpuVoltageInputs() {
+    static const char* const kCpuSensorNames[] = {"k10temp", "zenpower", "coretemp", "cpu_thermal"};
+    static const char* const kSuperIoPrefixes[] = {"nct6", "it8", "w836"};
+    static const char* const kCoreLabels[] = {"vcore", "cpu core", "svi2_core", "vddcr_cpu", "cpu vcore"};
+
+    std::vector<std::string> labelled, superIo, cpuSensor;
+    for (const fs::path& hwmon : listDirectory("/sys/class/hwmon")) {
+        const std::string dir = hwmon.string();
+        const std::string sensorName = readFirstLine(dir + "/name");
+
+        for (int i = 0; i < 16; ++i) {
+            std::string label = readFirstLine(format("%s/in%d_label", dir.c_str(), i));
+            if (label.empty()) continue;
+            for (char& c : label) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            const std::string input = format("%s/in%d_input", dir.c_str(), i);
+            for (const char* coreLabel : kCoreLabels) {
+                if (label == coreLabel && fileExists(input)) labelled.push_back(input);
+            }
+        }
+
+        for (const char* prefix : kSuperIoPrefixes) {
+            if (startsWith(sensorName, prefix) && fileExists(dir + "/in0_input")) {
+                superIo.push_back(dir + "/in0_input");
+            }
+        }
+
+        if (std::find(std::begin(kCpuSensorNames), std::end(kCpuSensorNames), sensorName) == std::end(kCpuSensorNames)) continue;
+        for (const char* input : {"in0_input", "in1_input", "in2_input"}) {
+            const std::string path = dir + "/" + input;
+            if (fileExists(path)) cpuSensor.push_back(path);
+        }
+    }
+
+    std::vector<std::string> inputs = labelled;
+    inputs.insert(inputs.end(), superIo.begin(), superIo.end());
+    inputs.insert(inputs.end(), cpuSensor.begin(), cpuSensor.end());
+    return inputs;
+}
+
+double readCpuVoltage(const std::vector<std::string>& inputs) {
+    for (const std::string& path : inputs) {
+        const double volts = readVoltage(path);
+        if (volts > 0.0) return volts;
+    }
+    return 0.0;
+}
+
+// ---- RAM -------------------------------------------------------------------
+
+RamStats readRamStats() {
+    long long totalKb = 0, availableKb = 0;
+    forEachLine("/proc/meminfo", [&](const char* line) {
+        if (startsWith(line, "MemTotal:"))          sscanf(line + 9, "%lld", &totalKb);
+        else if (startsWith(line, "MemAvailable:")) sscanf(line + 13, "%lld", &availableKb);
+        return (totalKb > 0 && availableKb > 0) ? kStop : kKeepGoing;
+    });
+
+    RamStats ram;
+    if (totalKb > 0) {
+        const long long usedKb = totalKb - availableKb;
+        ram.totalGb = static_cast<double>(totalKb) / kKbPerGb;
+        ram.usedGb  = static_cast<double>(usedKb) / kKbPerGb;
+        ram.percent = static_cast<float>(100.0 * static_cast<double>(usedKb) / static_cast<double>(totalKb));
+    }
+    return ram;
+}
+
+// ---- Uptime ----------------------------------------------------------------
+
+std::string readUptime() {
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) return "N/A";
+
+    const long days  = info.uptime / 86400;
+    const long hours = (info.uptime % 86400) / 3600;
+    const long mins  = (info.uptime % 3600) / 60;
+
+    std::string text;
+    if (days > 0)               text += format("%ldd ", days);
+    if (hours > 0 || days > 0)  text += format("%ldh ", hours);
+    text += format("%ldm", mins);
+    return text;
+}
+
+// ---- GPU: PCI name lookup --------------------------------------------------
+
+// Turns PCI ids (e.g. "0x1002", "0x73bf") into a friendly name using the
+// pci.ids database that ships with every distro. "" if not found.
+std::string lookupPciDeviceName(const std::string& vendorId, const std::string& deviceId) {
+    static const char* const kPciIdsPaths[] = {"/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids"};
+
+    if (vendorId.size() < 3 || deviceId.size() < 3) return "";
+    const std::string vendor = vendorId.substr(2);   // drop the "0x"
+    const std::string device = deviceId.substr(2);
+
+    // File layout:   "1002  Vendor name"      <- no indent
+    //                "\t73bf  Device name"    <- one tab
+    std::string name;
+    for (const char* path : kPciIdsPaths) {
+        bool inVendorSection = false;
+        forEachLine(path, [&](const char* line) {
+            if (line[0] == '#' || line[0] == '\0') return kKeepGoing;
+            if (line[0] != '\t') {
+                if (inVendorSection) return kStop;   // reached the next vendor without finding the device
+                inVendorSection = startsWith(line, vendor) && line[vendor.size()] == ' ';
+                return kKeepGoing;
+            }
+            if (inVendorSection && line[1] != '\t' && startsWith(line + 1, device)) {
+                name = trim(line + 1 + device.size());
+                return kStop;
+            }
+            return kKeepGoing;
+        });
+        if (!name.empty()) break;
+    }
+
+    // "Navi 21 [Radeon RX 6800 / 6800 XT]" -> "Radeon RX 6800 / 6800 XT"
+    const size_t open = name.find('[');
+    const size_t close = name.rfind(']');
+    if (open != std::string::npos && close != std::string::npos && close > open + 1) {
+        name = name.substr(open + 1, close - open - 1);
+    }
+    return name;
+}
+
+// ---- GPU: NVIDIA -----------------------------------------------------------
+
+// Runs ONE long-lived `nvidia-smi --loop-ms` process and reads its output.
+// Starting nvidia-smi every refresh is slow (it can freeze the window for a
+// moment and wastes CPU); a single process that streams a new line at our
+// update interval avoids that completely. If the user picks a different
+// interval, start() is simply called again to replace the process.
+class NvidiaSmiStream {
+public:
+    NvidiaSmiStream() = default;
+    NvidiaSmiStream(const NvidiaSmiStream&) = delete;
+    NvidiaSmiStream& operator=(const NvidiaSmiStream&) = delete;
+    ~NvidiaSmiStream() { stop(); }
+
+    bool running() const { return fd_ >= 0; }
+
+    // Starts (or restarts) nvidia-smi so it prints a line every `intervalMs`.
+    // `waitForFirstLineMs` is how long to wait for that first line: wanted at
+    // program start so the first frame has data, but 0 when restarting so the
+    // window never stalls (the old numbers stay on screen until a new line arrives).
+    bool start(int intervalMs, int waitForFirstLineMs) {
+        stop();
+        buffer_.clear();
+
+        int pipeEnds[2];
+        if (pipe(pipeEnds) != 0) return false;
+
+        // Child process: stdout -> our pipe, stderr -> /dev/null.
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, pipeEnds[1], STDOUT_FILENO);
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addclose(&actions, pipeEnds[0]);
+        posix_spawn_file_actions_addclose(&actions, pipeEnds[1]);
+
+        const std::string loopArgument = "--loop-ms=" + std::to_string(intervalMs);
+        const char* const args[] = {
+            "nvidia-smi", "-i", "0",   // first GPU only
+            "--query-gpu=gpu_name,utilization.gpu,memory.used,memory.total,clocks.current.graphics",
+            "--format=csv,noheader,nounits",
+            loopArgument.c_str(),
+            nullptr};
+        const int result = posix_spawnp(&pid_, "nvidia-smi", &actions, nullptr, const_cast<char* const*>(args), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pipeEnds[1]);
+
+        if (result != 0) {   // nvidia-smi isn't installed
+            close(pipeEnds[0]);
+            pid_ = -1;
+            return false;
+        }
+
+        fd_ = pipeEnds[0];
+        fcntl(fd_, F_SETFL, O_NONBLOCK);   // reading must never freeze the UI
+        fcntl(fd_, F_SETFD, FD_CLOEXEC);
+
+        if (waitForFirstLineMs > 0) {
+            pollfd waitForData{fd_, POLLIN, 0};
+            poll(&waitForData, 1, waitForFirstLineMs);
+        }
+        return true;
+    }
+
+    // Returns the newest complete line printed since the last call, or "" if none.
+    std::string latestLine() {
+        if (fd_ < 0) return "";
+
+        char chunk[512];
+        ssize_t bytes;
+        while ((bytes = read(fd_, chunk, sizeof(chunk))) > 0) buffer_.append(chunk, static_cast<size_t>(bytes));
+        if (bytes == 0) stop();   // nvidia-smi exited
+
+        const size_t lastNewline = buffer_.rfind('\n');
+        if (lastNewline == std::string::npos) return "";
+        size_t lineStart = (lastNewline == 0) ? std::string::npos : buffer_.rfind('\n', lastNewline - 1);
+        lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+
+        std::string line = buffer_.substr(lineStart, lastNewline - lineStart);
+        buffer_.erase(0, lastNewline + 1);
+        return line;
+    }
+
+private:
+    void stop() {
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+        if (pid_ > 0) {
+            kill(pid_, SIGTERM);
+            waitpid(pid_, nullptr, 0);
+            pid_ = -1;
+        }
+    }
+
+    pid_t pid_{-1};
+    int fd_{-1};
+    std::string buffer_;
+};
+
+// Parses one line like "NVIDIA GeForce RTX 3080, 12, 1500, 10240, 1800"
+// (name, GPU %, VRAM used MiB, VRAM total MiB, clock MHz).
+GpuStats parseNvidiaLine(const std::string& line) {
+    GpuStats gpu;
+    gpu.vendor = GpuVendor::Nvidia;
+
+    std::vector<std::string> fields;
+    size_t start = 0;
+    while (true) {
+        const size_t comma = line.find(',', start);
+        fields.push_back(trim(line.substr(start, comma == std::string::npos ? std::string::npos : comma - start)));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    if (fields.size() < 5) return gpu;
+
+    double usage = 0.0, usedMb = 0.0, totalMb = 0.0, clockMhz = 0.0;
+    if (!parseNumber(fields[1], usage)) return gpu;
+
+    gpu.name = fields[0];
+    gpu.gpuUsage = static_cast<float>(usage);
+    gpu.hasLoad = true;
+    if (parseNumber(fields[2], usedMb) && parseNumber(fields[3], totalMb) && totalMb > 0.0) {
+        gpu.hasMemory = true;
+        gpu.vramUsedGb  = usedMb / 1024.0;
+        gpu.vramTotalGb = totalMb / 1024.0;
+        gpu.vramUsage   = static_cast<float>(100.0 * usedMb / totalMb);
+    }
+    if (parseNumber(fields[4], clockMhz)) gpu.clockGhz = clockMhz / 1000.0;
+    return gpu;
+}
+
+// ---- GPU: helpers shared by the AMD / Intel / Mali readers -------------------
+
+// Every GPU appears as a folder like "/sys/class/drm/card0". This lists them,
+// skipping display outputs ("card0-DP-1") and render nodes ("renderD128").
+// `sysRoot` is "/sys" on a real machine; it is a parameter only so the code can
+// be tested against a fake folder tree.
+std::vector<std::string> listGpuCardDirs(const std::string& sysRoot) {
+    std::vector<std::string> cards;
+    for (const fs::path& entry : listDirectory(sysRoot + "/class/drm")) {
+        const std::string node = entry.filename().string();
+        if (startsWith(node, "card") && node.find('-') == std::string::npos) cards.push_back(entry.string());
+    }
+    return cards;
+}
+
+// The GPU's voltage sensor file ("in0_input", millivolts), or "" if it has none.
+std::string findHwmonVoltageInput(const std::string& deviceDir) {
+    for (const fs::path& hwmon : listDirectory(deviceDir + "/hwmon")) {
+        const std::string input = hwmon.string() + "/in0_input";
+        if (fileExists(input)) return input;
+    }
+    return "";
+}
+
+// Reads every card with `readOne`, e.g. readAll(amdCards, readAmdCard).
+template <typename Card, typename Reader>
+std::vector<GpuStats> readAll(std::vector<Card>& cards, Reader readOne) {
+    std::vector<GpuStats> all;
+    for (Card& card : cards) all.push_back(readOne(card));
+    return all;
+}
+
+// With several GPUs of one kind (say a laptop's integrated + dedicated card)
+// show the busiest one, or the one with more VRAM if they are equally busy.
+GpuStats pickBusiest(const std::vector<GpuStats>& candidates) {
+    GpuStats best;
+    bool first = true;
+    for (const GpuStats& current : candidates) {
+        if (first || current.gpuUsage > best.gpuUsage ||
+            (current.gpuUsage == best.gpuUsage && current.vramTotalGb > best.vramTotalGb)) {
+            best = current;
+        }
+        first = false;
+    }
+    return best;
+}
+
+// ---- GPU: AMD --------------------------------------------------------------
+
+// Paths for one AMD GPU, worked out once at startup.
+struct AmdCard {
+    std::string name{"AMD Radeon GPU"};
+    double vramTotalGb{0.0};
+    std::string busyPath, vramUsedPath, clockPath, voltagePath;
+};
+
+std::vector<AmdCard> findAmdCards(const std::string& sysRoot) {
+    std::vector<AmdCard> cards;
+    for (const std::string& cardDir : listGpuCardDirs(sysRoot)) {
+        const std::string dir = cardDir + "/device";
+        if (readFirstLine(dir + "/vendor") != kAmdVendorId) continue;
+
+        AmdCard card;
+        card.busyPath     = dir + "/gpu_busy_percent";
+        card.vramUsedPath = dir + "/mem_info_vram_used";
+        card.clockPath    = dir + "/pp_dpm_sclk";
+        card.voltagePath  = findHwmonVoltageInput(dir);
+
+        std::string name = readFirstLine(dir + "/product_name");
+        if (name.empty()) name = lookupPciDeviceName(kAmdVendorId, readFirstLine(dir + "/device"));
+        if (!name.empty()) card.name = name;
+
+        double vramBytes = 0.0;
+        if (readNumber(dir + "/mem_info_vram_total", vramBytes)) card.vramTotalGb = vramBytes / kBytesPerGb;
+
+        cards.push_back(card);
+    }
+    return cards;
+}
+
+GpuStats readAmdCard(const AmdCard& card) {
+    GpuStats gpu;
+    gpu.vendor = GpuVendor::Amd;
+    gpu.name = card.name;
+    gpu.vramTotalGb = card.vramTotalGb;
+
+    double value = 0.0;
+    if (readNumber(card.busyPath, value)) {
+        gpu.gpuUsage = static_cast<float>(value);
+        gpu.hasLoad = true;
+    } else {
+        gpu.loadNote = "Core load: not reported by driver";
+    }
+
+    if (card.vramTotalGb > 0.0 && readNumber(card.vramUsedPath, value)) {
+        gpu.vramUsedGb = value / kBytesPerGb;
+        gpu.vramUsage  = static_cast<float>(100.0 * gpu.vramUsedGb / gpu.vramTotalGb);
+        gpu.hasMemory = true;
+    }
+
+    // pp_dpm_sclk looks like "0: 300Mhz\n1: 1500Mhz *\n"; the line with '*' is the current clock.
+    forEachLine(card.clockPath, [&](const char* line) {
+        const char* colon = strchr(line, ':');
+        if (strchr(line, '*') && colon) gpu.clockGhz = strtod(colon + 1, nullptr) / 1000.0;
+        return kKeepGoing;
+    });
+
+    gpu.voltageV = readVoltage(card.voltagePath);
+    return gpu;
+}
+
+// ---- GPU: Intel ------------------------------------------------------------
+//
+// Intel GPUs have no "busy %" file that ordinary users can read. What they do
+// report is how long the GPU has spent asleep (the "RC6" power-saving state),
+// so the load shown is ESTIMATED as "the share of time NOT asleep". It runs a
+// little high (awake but barely working still counts as busy), which is why the
+// UI labels it "(est.)".
+//
+// Two kernel drivers exist - "i915" (most Intel GPUs) and "xe" (newest) - and
+// they use different file names, so we look for the known files of both.
+
+struct IntelCard {
+    std::string name{"Intel Graphics"};
+    std::string memoryNote;
+    std::vector<std::string> clockPaths;   // current clock in MHz, best source first
+    std::string idleCounterPath;           // total milliseconds spent asleep so far
+    std::string voltagePath;
+
+    // The previous reading, needed to turn the running total into a percentage.
+    double lastIdleMs{0.0};
+    double lastSampleMs{-1.0};   // -1 = no reading yet
+    bool haveLoad{false};
+    float loadPercent{0.0f};
+};
+
+// Integrated Intel graphics always sit at PCI address 0000:00:02.0 (Intel Arc
+// graphics cards do not). Integrated GPUs use ordinary system RAM as video memory.
+bool isIntegratedIntelGpu(const std::string& deviceDir) {
+    std::error_code error;
+    const fs::path realPath = fs::canonical(deviceDir, error);
+    return !error && realPath.filename() == "0000:00:02.0";
+}
+
+std::vector<IntelCard> findIntelCards(const std::string& sysRoot) {
+    std::vector<IntelCard> cards;
+    for (const std::string& cardDir : listGpuCardDirs(sysRoot)) {
+        const std::string dir = cardDir + "/device";
+        if (readFirstLine(dir + "/vendor") != kIntelVendorId) continue;
+
+        IntelCard card;
+        const std::string name = lookupPciDeviceName(kIntelVendorId, readFirstLine(dir + "/device"));
+        if (!name.empty()) card.name = name;
+        card.memoryNote = isIntegratedIntelGpu(dir) ? "VRAM: shares system RAM" : "VRAM: not reported by driver";
+
+        card.clockPaths = existingPaths({
+            cardDir + "/gt/gt0/rps_act_freq_mhz", cardDir + "/gt_act_freq_mhz",    // i915: actual clock
+            cardDir + "/gt/gt0/rps_cur_freq_mhz", cardDir + "/gt_cur_freq_mhz",    // i915: requested clock
+            dir + "/tile0/gt0/freq0/act_freq",    dir + "/tile0/gt0/freq0/cur_freq"});   // xe
+        card.idleCounterPath = firstExisting({
+            cardDir + "/gt/gt0/rc6_residency_ms", cardDir + "/power/rc6_residency_ms",   // i915
+            dir + "/tile0/gt0/gtidle/idle_residency_ms"});                               // xe
+        card.voltagePath = findHwmonVoltageInput(dir);
+
+        cards.push_back(card);
+    }
+    return cards;
+}
+
+GpuStats readIntelCard(IntelCard& card) {
+    GpuStats gpu;
+    gpu.vendor = GpuVendor::Intel;
+    gpu.name = card.name;
+    gpu.memoryNote = card.memoryNote;
+    gpu.voltageV = readVoltage(card.voltagePath);
+
+    for (const std::string& path : card.clockPaths) {   // a reading of 0 means "asleep right now", so try the next file
+        double mhz = 0.0;
+        if (readNumber(path, mhz) && mhz > 0.0) {
+            gpu.clockGhz = mhz / 1000.0;
+            break;
+        }
+    }
+
+    double idleMs = 0.0;
+    if (card.idleCounterPath.empty() || !readNumber(card.idleCounterPath, idleMs)) {
+        gpu.loadNote = "Core load: not reported by driver";
+        return gpu;
+    }
+
+    const double nowMs = monotonicMs();
+    if (card.lastSampleMs < 0.0) {   // first reading: nothing to compare with yet
+        card.lastIdleMs = idleMs;
+        card.lastSampleMs = nowMs;
+    } else if (nowMs - card.lastSampleMs >= 100.0) {
+        const double asleepFraction = (idleMs - card.lastIdleMs) / (nowMs - card.lastSampleMs);
+        card.loadPercent = static_cast<float>(100.0 * std::clamp(1.0 - asleepFraction, 0.0, 1.0));
+        card.haveLoad = true;
+        card.lastIdleMs = idleMs;
+        card.lastSampleMs = nowMs;
+    }
+
+    if (card.haveLoad) {
+        gpu.gpuUsage = card.loadPercent;
+        gpu.hasLoad = true;
+        gpu.loadIsEstimate = true;
+    } else {
+        gpu.loadNote = "Core load: measuring...";
+    }
+    return gpu;
+}
+
+// ---- GPU: ARM Mali ---------------------------------------------------------
+//
+// Mali GPUs (found in many handhelds and single-board computers) are not on
+// the PCI bus. The kernel's "devfreq" system reports the GPU's current clock,
+// and some vendor kernels also report a load percentage. The standard open
+// drivers (panfrost, panthor, lima) only give the clock, so for those the
+// load bar is replaced by a short note.
+
+struct MaliGpu {
+    std::string name{"ARM Mali GPU"};
+    std::string clockPath;   // devfreq "cur_freq", in Hz
+    std::string loadPath;    // a file holding the load percent, or "" if there is none
+};
+
+// True if the device folder belongs to a Mali GPU (by driver name or device tree).
+bool isMaliDevice(const std::string& deviceDir) {
+    static const char* const kMaliDrivers[] = {"panfrost", "panthor", "lima", "mali", "mali_kbase"};
+
+    std::error_code error;
+    const std::string driver = fs::read_symlink(deviceDir + "/driver", error).filename().string();
+    for (const char* known : kMaliDrivers) {
+        if (driver == known) return true;
+    }
+    for (const std::string& compatible : readNulSeparatedStrings(deviceDir + "/of_node/compatible")) {
+        if (startsWith(compatible, "arm,mali")) return true;
+    }
+    return false;
+}
+
+// "arm,mali-bifrost" in the device tree -> "ARM Mali (Bifrost)".
+std::string maliModelName(const std::string& deviceDir) {
+    for (std::string model : readNulSeparatedStrings(deviceDir + "/of_node/compatible")) {
+        if (!startsWith(model, "arm,mali-") || model.size() <= strlen("arm,mali-")) continue;
+        model = model.substr(strlen("arm,mali-"));
+        model[0] = static_cast<char>(toupper(static_cast<unsigned char>(model[0])));
+        return "ARM Mali (" + model + ")";
+    }
+    return "ARM Mali GPU";
+}
+
+std::optional<MaliGpu> findMaliGpu(const std::string& sysRoot) {
+    // Open drivers register a normal GPU card; Mali's own "kbase" driver
+    // registers /sys/class/misc/mali0 instead.
+    std::string deviceDir;
+    for (const std::string& cardDir : listGpuCardDirs(sysRoot)) {
+        if (isMaliDevice(cardDir + "/device")) {
+            deviceDir = cardDir + "/device";
+            break;
+        }
+    }
+    if (deviceDir.empty() && fileExists(sysRoot + "/class/misc/mali0/device")) {
+        deviceDir = sysRoot + "/class/misc/mali0/device";
+    }
+    if (deviceDir.empty()) return std::nullopt;
+
+    MaliGpu gpu;
+    gpu.name = maliModelName(deviceDir);
+
+    // Different kernels put the load percent in different places.
+    std::vector<std::string> loadCandidates = {deviceDir + "/utilisation", deviceDir + "/utilization"};
+    const std::vector<fs::path> devfreqFolders = listDirectory(deviceDir + "/devfreq");
+    if (!devfreqFolders.empty()) {
+        const std::string devfreqDir = devfreqFolders.front().string();
+        gpu.clockPath = devfreqDir + "/cur_freq";
+        loadCandidates.insert(loadCandidates.begin(), devfreqDir + "/load");
+    }
+    gpu.loadPath = firstExisting(loadCandidates);
+    return gpu;
+}
+
+GpuStats readMaliGpu(const MaliGpu& mali) {
+    GpuStats gpu;
+    gpu.vendor = GpuVendor::Mali;
+    gpu.name = mali.name;
+    gpu.memoryNote = "VRAM: shares system RAM";
+
+    double value = 0.0;
+    if (!mali.clockPath.empty() && readNumber(mali.clockPath, value)) gpu.clockGhz = value / 1e9;   // devfreq reports Hz
+
+    // "load" files look like "23@800000000Hz" (load, then clock) and "utilisation"
+    // files are a plain "23". Reading the number at the start handles both.
+    if (!mali.loadPath.empty() && readNumber(mali.loadPath, value) && value >= 0.0 && value <= 100.0) {
+        gpu.gpuUsage = static_cast<float>(value);
+        gpu.hasLoad = true;
+    } else {
+        gpu.loadNote = "Core load: not reported by driver";
+    }
+    return gpu;
+}
+
+// ---- GPU: pick the right reader and give the UI one simple interface --------
+
+bool hasNvidiaCard(const std::string& sysRoot) {
+    for (const std::string& cardDir : listGpuCardDirs(sysRoot)) {
+        if (readFirstLine(cardDir + "/device/vendor") == kNvidiaVendorId) return true;
+    }
+    return false;
+}
+
+class GpuMonitor {
+public:
+    explicit GpuMonitor(const std::string& sysRoot = "/sys") {
+        amdCards_   = findAmdCards(sysRoot);
+        intelCards_ = findIntelCards(sysRoot);
+        mali_       = findMaliGpu(sysRoot);
+
+        // If a machine has several kinds of GPU (typical for laptops) the most
+        // powerful one is shown: NVIDIA, then AMD, then Intel, then Mali.
+        if (fileExists("/proc/driver/nvidia/gpus") || commandExists("nvidia-smi")) vendor_ = GpuVendor::Nvidia;
+        else if (!amdCards_.empty())   vendor_ = GpuVendor::Amd;
+        else if (!intelCards_.empty()) vendor_ = GpuVendor::Intel;
+        else if (hasNvidiaCard(sysRoot)) vendor_ = GpuVendor::Nvidia;   // open "nouveau" driver: no stats, but we know the brand
+        else if (mali_)                vendor_ = GpuVendor::Mali;
+
+        nvidiaStats_.vendor = GpuVendor::Nvidia;
+        if (vendor_ == GpuVendor::Nvidia) nvidia_.start(nvidiaIntervalMs_, 2000);
+    }
+
+    // Called when the user picks a new update interval. Only NVIDIA needs to
+    // react: its nvidia-smi helper is restarted at the new rate. The other
+    // GPUs are read directly from files each refresh.
+    void setRefreshIntervalMs(int intervalMs) {
+        if (vendor_ != GpuVendor::Nvidia || intervalMs == nvidiaIntervalMs_) return;
+        nvidiaIntervalMs_ = intervalMs;
+        nvidia_.start(intervalMs, 0);
+    }
+
+    GpuStats read() {
+        switch (vendor_) {
+            case GpuVendor::Nvidia:  return readNvidia();
+            case GpuVendor::Amd:     return pickBusiest(readAll(amdCards_, readAmdCard));
+            case GpuVendor::Intel:   return pickBusiest(readAll(intelCards_, readIntelCard));
+            case GpuVendor::Mali:    return readMaliGpu(*mali_);
+            case GpuVendor::Unknown: break;
+        }
+        return GpuStats();
+    }
+
+private:
+    GpuStats readNvidia() {
+        const std::string line = nvidia_.latestLine();
+        if (!line.empty()) nvidiaStats_ = parseNvidiaLine(line);
+        if (!nvidia_.running()) {   // nvidia-smi is not installed or has stopped
+            nvidiaStats_.hasLoad = false;
+            nvidiaStats_.hasMemory = false;
+        }
+        return nvidiaStats_;
+    }
+
+    GpuVendor vendor_{GpuVendor::Unknown};
+    int nvidiaIntervalMs_{kDefaultRefreshMs};
+    NvidiaSmiStream nvidia_;
+    GpuStats nvidiaStats_;
+    std::vector<AmdCard> amdCards_;
+    std::vector<IntelCard> intelCards_;
+    std::optional<MaliGpu> mali_;
+};
+
+// ---- Everything live, in one place -----------------------------------------
+
+class LiveMonitor {
+public:
+    LiveMonitor() : previousCpu_(readCpuTimes()), cpuVoltageInputs_(findCpuVoltageInputs()) {
+        stats_.cpuPercent.assign(previousCpu_.size(), 0.0f);
+        readSensors();   // everything except CPU load, which needs two samples
+    }
+
+    void refresh() {
+        updateCpuLoad();
+        readSensors();
+    }
+
+    void setRefreshIntervalMs(int intervalMs) { gpu_.setRefreshIntervalMs(intervalMs); }
+
+    const LiveStats& stats() const { return stats_; }
+
+private:
+    // CPU load = how much of the time since the last sample each core spent working.
+    void updateCpuLoad() {
+        std::vector<CpuTimes> now = readCpuTimes();
+        if (now.size() != previousCpu_.size()) {
+            stats_.cpuPercent.assign(now.size(), 0.0f);   // a core went on/offline; start over
+        } else {
+            for (size_t i = 0; i < now.size(); ++i) {
+                const double totalDelta  = static_cast<double>(now[i].total - previousCpu_[i].total);
+                const double activeDelta = static_cast<double>(now[i].active - previousCpu_[i].active);
+                if (totalDelta > 0.0) stats_.cpuPercent[i] = static_cast<float>(100.0 * activeDelta / totalDelta);
+            }
+        }
+        previousCpu_ = std::move(now);
+    }
+
+    void readSensors() {
+        stats_.ram        = readRamStats();
+        stats_.gpu        = gpu_.read();
+        stats_.cpuFreqGhz = readCpuFreqGhz();
+        stats_.uptime     = readUptime();
+
+        const double now = monotonicMs();
+        if (lastVoltageReadMs_ < 0.0 || now - lastVoltageReadMs_ >= kVoltageReadIntervalMs) {
+            stats_.cpuVoltage = readCpuVoltage(cpuVoltageInputs_);
+            lastVoltageReadMs_ = now;
+        }
+    }
+
+    std::vector<CpuTimes> previousCpu_;
+    std::vector<std::string> cpuVoltageInputs_;
+    double lastVoltageReadMs_{-1.0};   // -1 = not read yet
+    GpuMonitor gpu_;
+    LiveStats stats_;
+};
+
 // ============================================================================
 // 5. UI
 // ============================================================================

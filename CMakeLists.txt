@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(CpuMonitor VERSION 1.2 LANGUAGES C CXX)
+project(CpuMonitor VERSION 1.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

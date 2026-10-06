@@ -1,6 +1,6 @@
 # VeeaStats
 
-A hardware monitor for Linux with five skins and an in-game overlay. See your CPU, memory and GPU load at a glance, and press **Ctrl+Shift+O** in a game to put those numbers in the corner of the screen.
+A hardware monitor for Linux with five skins and an in-game overlay. See your CPU, memory and GPU load at a glance, check how full your drives are, and press **Ctrl+Shift+O** in a game to put those numbers in the corner of the screen.
 
 ![VeeaStats in the JARV skin](docs/screenshots/jarv.png)
 
@@ -9,6 +9,7 @@ A hardware monitor for Linux with five skins and an in-game overlay. See your CP
 - **In-game overlay:** press Ctrl+Shift+O to show CPU, memory and GPU load, plus CPU and GPU voltage, at the top-left of the game you're playing. It's see-through, never takes focus, and lets clicks through to the game.
 - **Five skins:** Classic, JARV, Galactic Conflict, Federation Gunship and Halloween. The overlay matches whichever skin you pick.
 - **Live readings:** load per CPU core, CPU clock and voltage (VCore), memory, and GPU load, VRAM, clock and voltage, updated every 250 ms to 2 seconds.
+- **Storage usage:** click the hard-drive button at the top right to list your drives, then pick one to see a pie chart of its used and free space.
 - **Hardware details:** processor, motherboard and chipset, memory modules, drives, operating system, kernel, uptime and installed packages.
 - **All the major GPUs:** AMD, Intel and NVIDIA (through its driver's `nvidia-smi` tool), plus ARM Mali when built from source on ARM boards. With several GPUs, the busiest one is shown.
 - **Runs in the background if you want:** close the window and the overlay hotkey keeps working.
@@ -49,6 +50,18 @@ The overlay takes on the look of the active skin:
 | Any X11 session | Every app |
 
 The overlay can follow Proton and Wine games and other X11 apps. Native Wayland apps, such as Firefox on GNOME, don't tell other programs where their windows are. So with **Limit Overlay to Focused App** on, the hotkey does nothing in them; with it off, the overlay shows in the screen corner.
+
+## Storage usage
+
+![The storage menu with a drive's pie chart](docs/screenshots/storage.png)
+
+Click the hard-drive button next to the gear (hover over it for **View Storage Usage Stats**) to list every storage device connected to your PC, including USB drives. Click a drive to see a pie chart of its total, used and free space, and where it's mounted. Click the drive again to hide its chart, or anywhere else to close the menu.
+
+- **Used** and **Free** add up the space on every partition of the drive that's mounted. Linux can only measure the space inside mounted partitions.
+- **Other** is the rest of the drive: partitions that aren't mounted (a Windows partition, for example), unpartitioned space, and space the filesystem keeps for itself.
+- A drive with nothing mounted shows as **Not mounted**.
+
+The numbers refresh every 2 seconds while the menu is open.
 
 ## Skins
 

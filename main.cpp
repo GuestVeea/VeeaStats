@@ -55,6 +55,7 @@
 #include <spawn.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <sys/sysinfo.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
@@ -364,6 +365,15 @@ struct SystemInfo {
     std::string kernel;
     std::string packages;
     std::string shell;
+};
+
+// How full one storage device is. Space is only known for mounted filesystems,
+// so used and free are summed over the filesystems mounted from this device.
+struct DiskUsage {
+    DriveInfo drive;
+    double usedGb{0.0};
+    double freeGb{0.0};                     // space a normal user can still fill
+    std::vector<std::string> mountPoints;   // where each of its filesystems is mounted
 };
 
 // Things that never change while the program runs.
@@ -1511,6 +1521,73 @@ private:
     LiveStats stats_;
 };
 
+// ---- Storage usage -------------------------------------------------------------
+// Read when the storage menu is open, not every refresh.
+
+// /proc/mounts writes spaces and tabs in paths as octal escapes ("My\040Drive").
+std::string unescapeMountPath(std::string_view text) {
+    const auto isOctal = [&](size_t at) { return at < text.size() && text[at] >= '0' && text[at] <= '7'; };
+    std::string path;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\\' && isOctal(i + 1) && isOctal(i + 2) && isOctal(i + 3)) {
+            path += static_cast<char>((text[i + 1] - '0') * 64 + (text[i + 2] - '0') * 8 + (text[i + 3] - '0'));
+            i += 3;
+        } else {
+            path += text[i];
+        }
+    }
+    return path;
+}
+
+// The disk ("nvme0n1") that a block device ("nvme0n1p2", "dm-0") is on.
+// A partition's sysfs folder sits inside its disk's folder; an encrypted or LVM
+// volume (dm-*) lists the devices it is built on under "slaves".
+std::string diskOfBlockDevice(const std::string& name, int depth = 0) {
+    const std::string dir = "/sys/class/block/" + name;
+    if (fileExists(dir + "/partition")) {
+        std::error_code error;
+        return fs::canonical(dir, error).parent_path().filename().string();
+    }
+    const std::vector<fs::path> slaves = listDirectory(dir + "/slaves");
+    if (!slaves.empty() && depth < 4) return diskOfBlockDevice(slaves.front().filename().string(), depth + 1);
+    return name;
+}
+
+// Every storage device with how much of it is used and free.
+std::vector<DiskUsage> readDiskUsage() {
+    std::vector<DiskUsage> disks;
+    for (const DriveInfo& drive : readStorageDrives()) disks.push_back({drive});
+
+    // Each filesystem once, at its shortest mount point: btrfs mounts the same
+    // partition several times (/, /home, /var/log, ...).
+    std::map<std::string, std::string> mountPointOf;   // "sda2" -> "/"
+    forEachLine("/proc/self/mounts", [&](const char* line) {
+        char source[512], mountPoint[1024];
+        if (sscanf(line, "%511s %1023s", source, mountPoint) != 2 || !startsWith(source, "/dev/")) return kKeepGoing;
+        std::error_code error;
+        const std::string device = fs::canonical(unescapeMountPath(source), error).filename().string();   // follows /dev/mapper/... links
+        if (device.empty()) return kKeepGoing;
+        const std::string path = unescapeMountPath(mountPoint);
+        const auto [entry, added] = mountPointOf.emplace(device, path);
+        if (!added && path.size() < entry->second.size()) entry->second = path;
+        return kKeepGoing;
+    });
+
+    for (const auto& [device, mountPoint] : mountPointOf) {
+        const std::string diskName = diskOfBlockDevice(device);
+        const auto disk = std::find_if(disks.begin(), disks.end(),
+                                       [&](const DiskUsage& usage) { return usage.drive.deviceName == diskName; });
+        struct statvfs space;
+        if (disk == disks.end() || statvfs(mountPoint.c_str(), &space) != 0) continue;
+        const double gbPerBlock = static_cast<double>(space.f_frsize) / kBytesPerGb;
+        disk->usedGb += static_cast<double>(space.f_blocks - space.f_bfree) * gbPerBlock;
+        disk->freeGb += static_cast<double>(space.f_bavail) * gbPerBlock;
+        disk->mountPoints.push_back(mountPoint);
+    }
+    for (DiskUsage& disk : disks) std::sort(disk.mountPoints.begin(), disk.mountPoints.end());
+    return disks;
+}
+
 // ============================================================================
 // 5. UI
 // ============================================================================
@@ -1602,9 +1679,18 @@ void saveSettings(const Settings& settings) {
     fclose(file);
 }
 
+// The storage menu: its device list, and the device whose chart is showing.
+struct StorageMenu {
+    bool open{false};
+    std::string selected;            // deviceName of the chosen device ("" = none)
+    std::vector<DiskUsage> disks;
+    double readAt{-1.0e9};           // ImGui time of the last readDiskUsage()
+};
+
 // Everything the user can change from the window. main() reacts to changes after each frame.
 struct UiState {
     bool settingsOpen{false};   // the gear's menu is showing
+    StorageMenu storage;        // the storage button's menu
     bool quitRequested{false};  // "Quit VeeaStats" in the gear menu (only offered in background mode)
     Settings settings;
 };
@@ -1781,25 +1867,36 @@ void drawOsInfo(const StaticInfo& info, const LiveStats& live) {
     ImGui::EndTable();
 }
 
-// A gear-shaped button. The default font has no icon characters, so the gear is
-// drawn from shapes: a thick ring for the body plus rectangles for the teeth.
-// Returns true when clicked. `active` keeps it highlighted while its menu is open.
-bool drawGearButton(const char* id, float size, bool active) {
-    constexpr int kTeeth = 8;
+// A square button with an icon drawn from shapes (the default font has no icon
+// characters). Draws the hover highlight; the caller draws the icon at `center`
+// in `color`. `active` keeps it highlighted while its menu is open.
+struct IconButton {
+    bool clicked;
+    ImVec2 center;
+    ImU32 color;
+};
 
+IconButton iconButton(const char* id, float size, bool active, const char* tooltip) {
     const ImVec2 topLeft = ImGui::GetCursorScreenPos();
     const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size));
     const bool hovered = ImGui::IsItemHovered();
-    ImGui::SetItemTooltip("Settings");
+    ImGui::SetItemTooltip("%s", tooltip);
 
-    ImDrawList* draw = ImGui::GetWindowDrawList();
     if (hovered || active) {
-        draw->AddRectFilled(topLeft, ImVec2(topLeft.x + size, topLeft.y + size),
-                            ImGui::GetColorU32(ImGuiCol_FrameBgHovered), ImGui::GetStyle().FrameRounding);
+        ImGui::GetWindowDrawList()->AddRectFilled(topLeft, ImVec2(topLeft.x + size, topLeft.y + size),
+                                                  ImGui::GetColorU32(ImGuiCol_FrameBgHovered), ImGui::GetStyle().FrameRounding);
     }
+    return {clicked, ImVec2(topLeft.x + size * 0.5f, topLeft.y + size * 0.5f),
+            ImGui::GetColorU32((hovered || active) ? ImGuiCol_Text : ImGuiCol_TextDisabled)};
+}
 
-    const ImU32 color = ImGui::GetColorU32((hovered || active) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
-    const ImVec2 center(topLeft.x + size * 0.5f, topLeft.y + size * 0.5f);
+// A gear-shaped button: a thick ring for the body plus rectangles for the teeth.
+// Returns true when clicked.
+bool drawGearButton(const char* id, float size, bool active) {
+    constexpr int kTeeth = 8;
+
+    const auto [clicked, center, color] = iconButton(id, size, active, "Settings");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
     const float tipRadius  = size * 0.42f;
     const float bodyRadius = tipRadius * 0.72f;
     const float holeRadius = tipRadius * 0.32f;
@@ -1818,6 +1915,33 @@ bool drawGearButton(const char* id, float size, bool active) {
         draw->AddQuadFilled(ImVec2(base.x - side.x, base.y - side.y), ImVec2(tip.x - side.x, tip.y - side.y),
                             ImVec2(tip.x + side.x, tip.y + side.y),   ImVec2(base.x + side.x, base.y + side.y), color);
     }
+    return clicked;
+}
+
+// A hard-drive-shaped button: the drive seen from above with its lid off, like
+// the classic Mac hard disk icon - the case, the disk (platter) with its hub,
+// and the read/write arm swinging in from a corner. Returns true when clicked.
+bool drawStorageButton(const char* id, float size, bool active) {
+    const auto [clicked, center, color] = iconButton(id, size, active, "View Storage Usage Stats");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float line = std::max(1.0f, std::round(size * 0.07f));
+
+    // The case: a little taller than wide, like a 3.5" drive.
+    const float halfWidth = std::round(size * 0.32f), halfHeight = std::round(size * 0.40f);
+    const ImVec2 min(center.x - halfWidth, center.y - halfHeight), max(center.x + halfWidth, center.y + halfHeight);
+    draw->AddRect(min, max, color, size * 0.08f, 0, line);
+
+    // The platter fills the top of the case; the hub is a dot in its middle.
+    const float platterRadius = halfWidth * 0.78f;
+    const ImVec2 platter(center.x, min.y + halfWidth);
+    draw->AddCircle(platter, platterRadius, color, 0, line);
+    draw->AddCircleFilled(platter, std::max(1.2f, size * 0.05f), color);
+
+    // The arm: pivots in the bottom-right corner and reaches across the platter.
+    const ImVec2 pivot(max.x - halfWidth * 0.38f, max.y - halfWidth * 0.38f);
+    const ImVec2 head(platter.x + platterRadius * 0.35f, platter.y + platterRadius * 0.45f);
+    draw->AddLine(pivot, head, color, line);
+    draw->AddCircleFilled(pivot, std::max(1.5f, size * 0.07f), color);
     return clicked;
 }
 
@@ -1885,6 +2009,149 @@ void drawSettingsMenu(UiState& ui, const ImVec2& gearMin, const ImVec2& gearMax)
     ImGui::End();
 }
 
+// "931.5 GB", "1.82 TB"
+std::string sizeText(double gb) {
+    return gb >= 1000.0 ? format("%.2f TB", gb / 1024.0) : format("%.1f GB", gb);
+}
+
+// One slice of a pie, from angle `from` to `to` (radians, clockwise from 3 o'clock).
+// ImGui only fills convex shapes, so it is filled a quarter turn at a time.
+void drawPieSlice(ImDrawList* draw, const ImVec2& center, float radius, float from, float to, ImU32 color) {
+    for (float start = from; start < to; start += kPi * 0.5f) {
+        draw->PathLineTo(center);
+        draw->PathArcTo(center, radius, start, std::min(start + kPi * 0.5f, to));
+        draw->PathFillConvex(color);
+    }
+}
+
+// The pie chart of one device's space, with its legend beside it.
+void drawDiskChart(const DiskUsage& disk) {
+    struct Slice {
+        const char* label;
+        double gb;
+        ImU32 color;
+    };
+    const double totalGb = disk.drive.sizeGb;
+    const double otherGb = std::max(totalGb - disk.usedGb - disk.freeGb, 0.0);
+    const bool mounted = !disk.mountPoints.empty();
+    const Slice slices[] = {
+        {"Used", disk.usedGb, ImGui::GetColorU32(ImGuiCol_CheckMark)},
+        {"Free", disk.freeGb, ImGui::GetColorU32(ImGuiCol_TextDisabled, 0.55f)},
+        {mounted ? "Other" : "Not mounted", otherGb, ImGui::GetColorU32(ImGuiCol_TextDisabled, 0.25f)},
+    };
+
+    // The pie: slices clockwise from 12 o'clock, without anti-aliasing so the
+    // quarter-turn pieces join seamlessly, then an anti-aliased rim on top.
+    const float radius = std::round(ImGui::GetFontSize() * 3.2f);
+    const ImVec2 topLeft = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(radius * 2.0f, radius * 2.0f));
+    const ImVec2 center(topLeft.x + radius, topLeft.y + radius);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImDrawListFlags flags = draw->Flags;
+    draw->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+    float angle = -kPi * 0.5f;
+    for (const Slice& slice : slices) {
+        if (totalGb <= 0.0 || slice.gb <= 0.0) continue;
+        const float sweep = 2.0f * kPi * static_cast<float>(std::min(slice.gb / totalGb, 1.0));
+        drawPieSlice(draw, center, radius, angle, angle + sweep, slice.color);
+        angle += sweep;
+    }
+    draw->Flags = flags;
+    draw->AddCircle(center, radius, ImGui::GetColorU32(ImGuiCol_Border), 0, 1.0f);
+
+    // The legend, vertically centred beside the pie.
+    ImGui::SameLine(0.0f, 16.0f);
+    const float rowHeight = ImGui::GetTextLineHeightWithSpacing();
+    ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, center.y - rowHeight * 2.0f));
+    ImGui::BeginGroup();
+    if (ImGui::BeginTable("##Legend", 3, ImGuiTableFlags_SizingFixedFit)) {
+        const float swatch = std::round(ImGui::GetFontSize() * 0.7f);
+        const auto row = [&](const char* label, double gb, const ImU32* color) {
+            ImGui::TableNextColumn();
+            if (color) {
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                const float top = at.y + std::round((ImGui::GetTextLineHeight() - swatch) * 0.5f);
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(at.x, top), ImVec2(at.x + swatch, top + swatch), *color);
+            }
+            ImGui::Dummy(ImVec2(swatch, ImGui::GetTextLineHeight()));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(label);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(totalGb > 0.0 ? format("%s  %3.0f%%", sizeText(gb).c_str(), 100.0 * gb / totalGb).c_str()
+                                                 : sizeText(gb).c_str());
+        };
+        for (const Slice& slice : slices) {
+            if (slice.gb > 0.0 || (mounted && &slice != &slices[2])) row(slice.label, slice.gb, &slice.color);
+        }
+        ImGui::TableNextColumn();
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("Total");
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", sizeText(totalGb).c_str());
+        ImGui::EndTable();
+    }
+    ImGui::EndGroup();
+
+    std::string where;
+    for (const std::string& mountPoint : disk.mountPoints) where += (where.empty() ? "" : ", ") + mountPoint;
+    ImGui::SetCursorScreenPos(ImVec2(topLeft.x, topLeft.y + radius * 2.0f + ImGui::GetStyle().ItemSpacing.y));
+    ImGui::TextDisabled("%s", mounted ? ("Mounted at " + where).c_str() : "Not mounted: its space can't be read");
+    if (mounted && otherGb > 0.0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        ImGui::SetItemTooltip("Other: partitions that aren't mounted, unpartitioned space,\nand space the filesystem keeps for itself");
+    }
+}
+
+// The menu that drops down from the storage button (buttonMin/buttonMax = the
+// button's rectangle): one row per storage device; clicking a row shows its
+// chart. Closes like the settings menu.
+void drawStorageMenu(UiState& ui, const ImVec2& buttonMin, const ImVec2& buttonMax) {
+    StorageMenu& menu = ui.storage;
+    const double now = ImGui::GetTime();
+    if (now - menu.readAt > 2.0) {   // fresh numbers when it opens, then every couple of seconds
+        menu.disks = readDiskUsage();
+        menu.readAt = now;
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(buttonMax.x, buttonMax.y + 6.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(260.0f, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::Begin("Storage", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+
+    ImGui::TextDisabled("Storage Devices");
+    if (menu.disks.empty()) ImGui::TextUnformatted("No storage devices found");
+    const DiskUsage* chosen = nullptr;
+    if (!menu.disks.empty() && ImGui::BeginTable("##Devices", 2, ImGuiTableFlags_SizingFixedFit)) {
+        for (const DiskUsage& disk : menu.disks) {
+            const bool isChosen = (disk.drive.deviceName == menu.selected);
+            if (isChosen) chosen = &disk;
+            ImGui::TableNextColumn();
+            if (ImGui::Selectable(format("%s##%s", disk.drive.model.c_str(), disk.drive.deviceName.c_str()).c_str(), isChosen,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                menu.selected = isChosen ? "" : disk.drive.deviceName;   // clicking the chosen one again hides its chart
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s  %s", sizeText(disk.drive.sizeGb).c_str(), disk.drive.type.c_str());
+        }
+        ImGui::EndTable();
+    }
+    if (chosen) {
+        ImGui::Separator();
+        drawDiskChart(*chosen);
+    }
+
+    const bool clickedElsewhere = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                                  !ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
+                                                          ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                                  !ImGui::IsMouseHoveringRect(buttonMin, buttonMax, false);
+    if (clickedElsewhere || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        menu.open = false;
+        menu.readAt = -1.0e9;   // read again next time it opens
+    }
+    ImGui::End();
+}
+
 // The whole window in the Classic skin: performance on top, system details below.
 // `ui` is read and (if the user changes something) updated here.
 void drawDashboard(const ImVec2& windowSize, UiState& ui, const StaticInfo& info, const LiveStats& live) {
@@ -1892,13 +2159,17 @@ void drawDashboard(const ImVec2& windowSize, UiState& ui, const StaticInfo& info
     ImGui::SetNextWindowSize(windowSize);
     ImGui::Begin("VeeaStats", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    // Title on the left, settings gear pinned to the right edge of the same row.
+    // Title on the left; the storage button and settings gear pinned to the right edge of the same row.
     const float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-    const float gearSize = ImGui::GetFrameHeight();
-    ImGui::AlignTextToFramePadding();   // centres the title on the gear's height
+    const float buttonSize = ImGui::GetFrameHeight();
+    const float buttonGap = 4.0f;
+    ImGui::AlignTextToFramePadding();   // centres the title on the buttons' height
     ImGui::TextColored(kTitleColor, "System Performance Dashboard");
-    ImGui::SameLine(rightEdge - gearSize);
-    if (drawGearButton("##Settings", gearSize, ui.settingsOpen)) ui.settingsOpen = !ui.settingsOpen;
+    ImGui::SameLine(rightEdge - buttonSize * 2.0f - buttonGap);
+    if (drawStorageButton("##Storage", buttonSize, ui.storage.open)) ui.storage.open = !ui.storage.open;
+    const ImVec2 storageMin = ImGui::GetItemRectMin(), storageMax = ImGui::GetItemRectMax();
+    ImGui::SameLine(0.0f, buttonGap);
+    if (drawGearButton("##Settings", buttonSize, ui.settingsOpen)) ui.settingsOpen = !ui.settingsOpen;
     const ImVec2 gearMin = ImGui::GetItemRectMin(), gearMax = ImGui::GetItemRectMax();
 
     ImGui::Separator();
@@ -1933,6 +2204,7 @@ void drawDashboard(const ImVec2& windowSize, UiState& ui, const StaticInfo& info
 
     ImGui::End();
 
+    if (ui.storage.open) drawStorageMenu(ui, storageMin, storageMax);
     if (ui.settingsOpen) drawSettingsMenu(ui, gearMin, gearMax);
 }
 
@@ -1955,6 +2227,11 @@ struct Box {
     ImVec2 min, max;
     float width() const { return max.x - min.x; }
     float height() const { return max.y - min.y; }
+};
+
+// Where a header put its storage and settings buttons.
+struct HeaderButtons {
+    Box storage, gear;
 };
 
 ImU32 withAlpha(const ImVec4& color, float alpha) {
@@ -2075,8 +2352,8 @@ struct HudSkin {
 
     // The window background (drawn behind everything).
     void (*background)(const ImVec2& windowSize, const HudState& state){};
-    // Title, clock and the gear button. Returns the gear's rectangle.
-    Box (*header)(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state){};
+    // Title, clock and the storage and settings buttons. Returns the buttons' rectangles.
+    HeaderButtons (*header)(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state){};
     // The four gauges, across `box`.
     void (*gauges)(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live){};
     // A panel's frame and title. Returns the area left for its contents.
@@ -2186,7 +2463,7 @@ void drawHudDashboard(const ImVec2& windowSize, UiState& ui, const HudSkin& skin
     const float bottomHeight = std::floor(std::max(rest - middleHeight, 170.0f));
     const float split = origin.x + std::floor(width * 0.58f);   // left/right panel boundary
 
-    const Box gear = skin.header(draw, Box{origin, origin + ImVec2(width, kHeaderHeight)}, ui, state);
+    const HeaderButtons buttons = skin.header(draw, Box{origin, origin + ImVec2(width, kHeaderHeight)}, ui, state);
 
     float y = origin.y + kHeaderHeight + kGap;
     skin.gauges(draw, Box{ImVec2(origin.x, y), ImVec2(origin.x + width, y + gaugeHeight)}, state, live);
@@ -2205,7 +2482,8 @@ void drawHudDashboard(const ImVec2& windowSize, UiState& ui, const HudSkin& skin
     ImGui::Dummy(ImVec2(width, y - origin.y));
     ImGui::End();
 
-    if (ui.settingsOpen) drawSettingsMenu(ui, gear.min, gear.max);
+    if (ui.storage.open) drawStorageMenu(ui, buttons.storage.min, buttons.storage.max);
+    if (ui.settingsOpen) drawSettingsMenu(ui, buttons.gear.min, buttons.gear.max);
 }
 
 // The clock and date as shown in the headers: "09:41", "05 OCT 2026".
@@ -2220,12 +2498,17 @@ void currentClock(std::string& clock, std::string& date) {
     date = upperCase(dateText);
 }
 
-// Places the gear button at the right end of a header row. Returns its rectangle.
-Box drawHeaderGear(UiState& ui, float right, float midY) {
-    const float gearSize = ImGui::GetFrameHeight();
-    ImGui::SetCursorScreenPos(ImVec2(right - gearSize, midY - gearSize * 0.5f));
-    if (drawGearButton("##Settings", gearSize, ui.settingsOpen)) ui.settingsOpen = !ui.settingsOpen;
-    return Box{ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+// Places the storage and settings buttons at the right end of a header row.
+HeaderButtons drawHeaderButtons(UiState& ui, float right, float midY) {
+    const float size = ImGui::GetFrameHeight();
+    HeaderButtons buttons;
+    ImGui::SetCursorScreenPos(ImVec2(right - size, midY - size * 0.5f));
+    if (drawGearButton("##Settings", size, ui.settingsOpen)) ui.settingsOpen = !ui.settingsOpen;
+    buttons.gear = Box{ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+    ImGui::SetCursorScreenPos(ImVec2(right - size * 2.0f - 4.0f, midY - size * 0.5f));
+    if (drawStorageButton("##Storage", size, ui.storage.open)) ui.storage.open = !ui.storage.open;
+    buttons.storage = Box{ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+    return buttons;
 }
 
 // ---- JARV ---------------------------------------------------------------------
@@ -2504,8 +2787,8 @@ void drawJarvCores(ImDrawList* draw, const Box& box, const HudState& jarv) {
 }
 
 // Title on the left; live light, clock and the gear on the
-// right; a glowing rule underneath. Returns the gear's rectangle.
-Box drawJarvHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& jarv) {
+// right; a glowing rule underneath. Returns the buttons' rectangles.
+HeaderButtons drawJarvHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& jarv) {
     ImFont* display = jarv.displayFont;
     const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 2.0f;
 
@@ -2516,8 +2799,8 @@ Box drawJarvHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState
                   withAlpha(kJarvMuted, 1.0f), "// SYSTEM DIAGNOSTICS");
 
     // Right-hand side, placed from the right edge inwards.
-    const Box gear = drawHeaderGear(ui, box.max.x, midY);
-    float right = gear.min.x - 20.0f;
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    float right = buttons.storage.min.x - 20.0f;
 
     std::string clock, date;
     currentClock(clock, date);
@@ -2544,7 +2827,7 @@ Box drawJarvHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState
         const float x = box.max.x - 6.0f * static_cast<float>(i) - 3.0f;
         draw->AddRectFilled(ImVec2(x - 3.0f, ruleY - 3.0f), ImVec2(x, ruleY + 1.0f), withAlpha(kJarvCyan, 0.6f));
     }
-    return gear;
+    return buttons;
 }
 
 void applyJarvStyle(ImGuiStyle& style) {
@@ -2829,8 +3112,8 @@ void drawGalacticCores(ImDrawList* draw, const Box& box, const HudState& state) 
 }
 
 // White title with a gold subtitle; the clock, a blinking red "LIVE" light and
-// the gear on the right; a double rule underneath. Returns the gear's rectangle.
-Box drawGalacticHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+// the gear on the right; a double rule underneath. Returns the buttons' rectangles.
+HeaderButtons drawGalacticHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
     ImFont* display = state.displayFont;
     const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 3.0f;
 
@@ -2841,8 +3124,8 @@ Box drawGalacticHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudS
     const ImVec2 subtitleExtent = textSize(display, 9.0f, "TACTICAL READOUT");
     draw->AddText(display, 9.0f, ImVec2(subtitleX + 10.0f, midY - subtitleExtent.y * 0.5f), withAlpha(kGcGold, 1.0f), "TACTICAL READOUT");
 
-    const Box gear = drawHeaderGear(ui, box.max.x, midY);
-    float right = gear.min.x - 20.0f;
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    float right = buttons.storage.min.x - 20.0f;
 
     std::string clock, date;
     currentClock(clock, date);
@@ -2867,7 +3150,7 @@ Box drawGalacticHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudS
     draw->AddLine(ImVec2(box.min.x, ruleY + 3.0f), ImVec2(box.max.x, ruleY + 3.0f), withAlpha(kGcBlue, 0.25f));
     draw->AddRectFilled(ImVec2(box.min.x, ruleY - 1.0f), ImVec2(box.min.x + 140.0f, ruleY + 1.0f), withAlpha(kGcGold, 0.9f));
     draw->AddRectFilled(ImVec2(box.max.x - 18.0f, ruleY - 2.0f), ImVec2(box.max.x, ruleY + 2.0f), withAlpha(kGcRed, 0.9f));
-    return gear;
+    return buttons;
 }
 
 void applyGalacticStyle(ImGuiStyle& style) {
@@ -3139,8 +3422,8 @@ void drawGunshipCores(ImDrawList* draw, const Box& box, const HudState& state) {
 }
 
 // Magenta pixel title; a "LIVE" legend with a blinking blue light, the clock and
-// the gear on the right; a pale rule with notches underneath. Returns the gear's rectangle.
-Box drawGunshipHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+// the gear on the right; a pale rule with notches underneath. Returns the buttons' rectangles.
+HeaderButtons drawGunshipHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
     ImFont* display = state.displayFont;
     const float midY = snapToPixel((box.min.y + box.max.y) * 0.5f) - 4.0f;
 
@@ -3148,8 +3431,8 @@ Box drawGunshipHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudSt
     drawOutlinedText(draw, display, 8.0f, ImVec2(box.min.x + textSize(display, 16.0f, "VEEASTATS").x + 14.0f, midY - 2.0f), kFgYellow,
                   "SYSTEM STATUS");
 
-    const Box gear = drawHeaderGear(ui, box.max.x, midY);
-    float right = gear.min.x - 18.0f;
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    float right = buttons.storage.min.x - 18.0f;
 
     std::string clock, date;
     currentClock(clock, date);
@@ -3171,7 +3454,7 @@ Box drawGunshipHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudSt
     for (float x = snapToPixel(box.min.x); x < box.max.x; x += 16.0f) {
         draw->AddRectFilled(ImVec2(x, ruleY + kPx), ImVec2(x + kPx, ruleY + kPx * 3), withAlpha(kFgFrame, 0.6f));
     }
-    return gear;
+    return buttons;
 }
 
 void applyGunshipStyle(ImGuiStyle& style) {
@@ -3552,8 +3835,8 @@ void drawCandleFlame(ImDrawList* draw, const ImVec2& base, float height, const H
 }
 
 // The spooky title, a candle-lit "LIVE", the clock and the gear; goo dripping
-// along the bottom. Returns the gear's rectangle.
-Box drawHalloweenHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+// along the bottom. Returns the buttons' rectangles.
+HeaderButtons drawHalloweenHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
     const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 5.0f;
     const ImVec2 titleExtent = textSize(state.displayFont, 34.0f, "VeeaStats");
     drawHalloweenText(draw, state.displayFont, 34.0f, ImVec2(box.min.x, midY - titleExtent.y * 0.5f), kHwOrange, "VeeaStats", 2.5f);
@@ -3561,8 +3844,8 @@ Box drawHalloweenHeader(ImDrawList* draw, const Box& box, UiState& ui, const Hud
     drawHalloweenText(draw, state.textFont, 13.0f, ImVec2(box.min.x + titleExtent.x + 14.0f, midY - subtitleExtent.y * 0.5f + 3.0f), kHwMist,
                       "Haunted Hardware", 1.0f);
 
-    const Box gear = drawHeaderGear(ui, box.max.x, midY);
-    float right = gear.min.x - 18.0f;
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    float right = buttons.storage.min.x - 18.0f;
 
     std::string clock, date;
     currentClock(clock, date);
@@ -3579,7 +3862,7 @@ Box drawHalloweenHeader(ImDrawList* draw, const Box& box, UiState& ui, const Hud
     drawHalloweenText(draw, state.textFont, 12.0f, ImVec2(right + 4.0f, midY - liveExtent.y * 0.5f + 1.0f), kHwOrange, "LIVE", 1.0f);
 
     drawGooBand(draw, Box{ImVec2(box.min.x, box.max.y - 7.0f), ImVec2(box.max.x, box.max.y - 1.0f)}, state);
-    return gear;
+    return buttons;
 }
 
 void applyHalloweenStyle(ImGuiStyle& style) {

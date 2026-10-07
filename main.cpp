@@ -6635,6 +6635,23 @@ std::string hotkeyDeclinedMarkerPath() {
     return settingsPath.empty() ? "" : fs::path(settingsPath).parent_path().string() + "/hotkey-declined";
 }
 
+// Tells the portal who we are (matching veeastats.desktop). This has to be the
+// first portal call on the D-Bus connection: after any other, the portal has
+// already filed VeeaStats as an unknown app, and the GlobalShortcuts portal
+// turns unknown apps away. The shortcut and appearance code share one
+// connection (GLib's session bus), so whichever gets there first does it.
+// Flatpak and Snap apps are identified without this, and older portals lack it.
+void registerWithPortal(const GioApi& gio, GDBusConnection* bus) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        GError* error = nullptr;
+        GVariant* reply = gio.callSync(bus, kPortalBusName, kPortalPath, "org.freedesktop.host.portal.Registry", "Register",
+                                       gio.newParsed("('veeastats', @a{sv} {})"), nullptr, G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, &error);
+        if (reply) gio.unref(reply);
+        else       gio.freeError(error);
+    });
+}
+
 class ShortcutsPortal {
 public:
     // Registers Ctrl+Shift+O with the desktop, then posts kRequestToggleOverlay
@@ -6656,13 +6673,7 @@ public:
         sender_ = gio_.uniqueName(bus_) + 1;
         std::replace(sender_.begin(), sender_.end(), '.', '_');
 
-        // The portal identifies Flatpak and Snap apps by themselves; anything
-        // else has to say who it is (matching veeastats.desktop) before its first
-        // call. Older portals don't have this and don't need it.
-        if (GVariant* reply = call("org.freedesktop.host.portal.Registry", "Register",
-                                   gio_.newParsed("('veeastats', @a{sv} {})"))) {
-            gio_.unref(reply);
-        }
+        registerWithPortal(gio_, bus_);
 
         std::string token = nextToken();
         GVariant* results = request("CreateSession", gio_.newParsed("({'handle_token': <%s>, 'session_handle_token': <%s>},)",
@@ -6809,6 +6820,7 @@ public:
             gio_.freeError(error);
             return;
         }
+        registerWithPortal(gio_, bus_);   // before reading anything (see there)
         for (const char* key : {"color-scheme", "accent-color"}) {
             if (GVariant* value = read(key)) {
                 store(key, value);

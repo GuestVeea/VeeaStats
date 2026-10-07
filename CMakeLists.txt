@@ -90,4 +90,6 @@ install(FILES packaging/veeastats.svg DESTINATION share/icons/hicolor/scalable/a
 # for the license to travel with the program.
 install(FILES fonts/OFL-Orbitron.txt fonts/OFL-Rajdhani.txt fonts/OFL-Michroma.txt fonts/OFL-SairaSemiCondensed.txt
               fonts/OFL-PressStart2P.txt fonts/OFL-Tiny5.txt
-              fonts/OFL-HennyPenny.txt fonts/OFL-Fredoka.txt DESTINATION share/licenses/veeastats)
+              fonts/OFL-HennyPenny.txt fonts/OFL-Fredoka.txt fonts/OFL-Cinzel.txt fonts/OFL-Marcellus.txt
+              fonts/OFL-DelaGothicOne.txt fonts/OFL-MPlusRounded1c.txt fonts/OFL-ChakraPetch.txt fonts/OFL-Inter.txt
+        DESTINATION share/licenses/veeastats)

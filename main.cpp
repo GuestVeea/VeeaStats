@@ -6,8 +6,9 @@
 //   3. Static info     - read ONCE at startup (CPU name, drives, OS, ...)
 //   4. Live stats      - re-read every update interval (CPU load, RAM, GPU, ...)
 //   5. UI              - settings, shared widgets and the Classic skin
-//   6. HUD skins       - JARV, Galactic Conflict, Federation Gunship and
-//                        Halloween: one shared layout, each skin drawing it its own way
+//   6. HUD skins       - JARV, Galactic Conflict, Federation Gunship, Halloween,
+//                        Poseidon, Otaku, Cyber-Punk and Classroom: one shared layout,
+//                        each skin drawing it its own way
 //   7. Skin switching  - fonts, styles and picking which skin draws the window
 //   8. Overlay         - the Ctrl+Shift+O in-game overlay, its hotkey, and
 //                        running in the background
@@ -39,9 +40,16 @@
 
 // Fonts for the HUD skins, embedded so nothing needs installing (SIL Open Font
 // License; see fonts/). Trimmed to Western European characters to keep them small.
+#include "fonts/chakrapetch_bold.h"
+#include "fonts/cinzel_bold.h"
+#include "fonts/delagothicone_regular.h"
 #include "fonts/fredoka_semibold.h"
 #include "fonts/hennypenny_regular.h"
+#include "fonts/inter_bold.h"
+#include "fonts/inter_regular.h"
+#include "fonts/marcellus_regular.h"
 #include "fonts/michroma_regular.h"
+#include "fonts/mplusrounded1c_extrabold.h"
 #include "fonts/orbitron_semibold.h"
 #include "fonts/pressstart2p_regular.h"
 #include "fonts/rajdhani_semibold.h"
@@ -284,6 +292,28 @@ double readVoltage(const std::string& path) {
     return (millivolts > 100.0 && millivolts < 2500.0) ? millivolts / 1000.0 : 0.0;
 }
 
+// Reads a temperature sensor file (millidegrees Celsius) and returns °C. Returns
+// 0 if the file is missing or holds an implausible number (unused inputs read 0,
+// and some report junk such as -128).
+double readTemperature(const std::string& path) {
+    double millidegrees = 0.0;
+    if (path.empty() || !readNumber(path, millidegrees)) return 0.0;
+    const double celsius = millidegrees / 1000.0;
+    return (celsius > 0.0 && celsius < 150.0) ? celsius : 0.0;
+}
+
+// The temperature file of the first thermal zone whose type contains one of
+// `typeParts` ("x86_pkg_temp", "cpu-thermal", "gpu_thermal", ...), or "".
+std::string findThermalZone(const std::string& sysRoot, std::initializer_list<const char*> typeParts) {
+    for (const fs::path& zone : listDirectory(sysRoot + "/class/thermal")) {
+        const std::string type = readFirstLine(zone.string() + "/type");
+        for (const char* part : typeParts) {
+            if (type.find(part) != std::string::npos && fileExists(zone.string() + "/temp")) return zone.string() + "/temp";
+        }
+    }
+    return "";
+}
+
 // Milliseconds on a clock that never jumps backwards (for measuring intervals).
 double monotonicMs() {
     timespec now;
@@ -341,6 +371,7 @@ struct GpuStats {
     double vramTotalGb{0.0};
     double clockGhz{0.0};
     double voltageV{0.0};
+    double temperatureC{0.0};     // 0 = no sensor
     bool hasLoad{false};          // gpuUsage is valid
     bool loadIsEstimate{false};   // ...but only approximate (Intel)
     bool hasMemory{false};        // the vram... numbers are valid
@@ -390,6 +421,7 @@ struct LiveStats {
     std::vector<float> cpuPercent;   // one entry per core
     double cpuFreqGhz{0.0};
     double cpuVoltage{0.0};
+    double cpuTemperatureC{0.0};   // 0 = no sensor
     RamStats ram;
     GpuStats gpu;
     std::string uptime{"N/A"};
@@ -855,6 +887,43 @@ double readCpuVoltage(const std::vector<std::string>& inputs) {
     return 0.0;
 }
 
+// Finds the sensor file for the CPU's temperature, best guess first. Done once
+// at startup.
+//   AMD:   k10temp or zenpower. "Tdie" is the die itself; some Ryzens also
+//          report "Tctl", raised a few degrees for fan control, so Tdie wins.
+//   Intel: coretemp's "Package id 0" (the whole chip, not a single core).
+//   ARM boards: cpu_thermal.
+//   Anything else: a thermal zone the kernel names after the CPU.
+std::string findCpuTemperatureInput() {
+    static const char* const kCpuSensorNames[] = {"k10temp", "zenpower", "coretemp", "cpu_thermal"};
+    static const char* const kBestLabels[] = {"tdie", "tctl", "package id 0"};   // in order of preference
+    constexpr int kUnlabelled = 3, kOtherLabel = 4;                               // then these
+
+    std::string best;
+    int bestRank = kOtherLabel + 1;
+    for (const fs::path& hwmon : listDirectory("/sys/class/hwmon")) {
+        const std::string dir = hwmon.string();
+        const std::string sensorName = readFirstLine(dir + "/name");
+        if (std::find(std::begin(kCpuSensorNames), std::end(kCpuSensorNames), sensorName) == std::end(kCpuSensorNames)) continue;
+
+        for (int i = 1; i <= 16; ++i) {
+            const std::string input = format("%s/temp%d_input", dir.c_str(), i);
+            if (!fileExists(input)) continue;
+            std::string label = readFirstLine(format("%s/temp%d_label", dir.c_str(), i));
+            for (char& c : label) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            int rank = label.empty() ? kUnlabelled : kOtherLabel;
+            for (int j = 0; j < 3; ++j) {
+                if (label == kBestLabels[j]) rank = j;
+            }
+            if (rank < bestRank) {
+                best = input;
+                bestRank = rank;
+            }
+        }
+    }
+    return best.empty() ? findThermalZone("/sys", {"x86_pkg_temp", "cpu"}) : best;
+}
+
 // ---- RAM -------------------------------------------------------------------
 
 RamStats readRamStats() {
@@ -970,7 +1039,7 @@ public:
         const std::string loopArgument = "--loop-ms=" + std::to_string(intervalMs);
         const char* const args[] = {
             "nvidia-smi",   // every NVIDIA GPU, one line each
-            "--query-gpu=index,gpu_name,utilization.gpu,memory.used,memory.total,clocks.current.graphics",
+            "--query-gpu=index,gpu_name,utilization.gpu,memory.used,memory.total,clocks.current.graphics,temperature.gpu",
             "--format=csv,noheader,nounits",
             loopArgument.c_str(),
             nullptr};
@@ -1058,6 +1127,8 @@ bool parseNvidiaLine(const std::string& line, int& index, GpuStats& gpu) {
         gpu.vramUsage   = static_cast<float>(100.0 * usedMb / totalMb);
     }
     if (parseNumber(fields[5], clockMhz)) gpu.clockGhz = clockMhz / 1000.0;
+    double celsius = 0.0;
+    if (fields.size() > 6 && parseNumber(fields[6], celsius) && celsius > 0.0) gpu.temperatureC = celsius;
     return true;
 }
 
@@ -1081,6 +1152,23 @@ std::string findHwmonVoltageInput(const std::string& deviceDir) {
     for (const fs::path& hwmon : listDirectory(deviceDir + "/hwmon")) {
         const std::string input = hwmon.string() + "/in0_input";
         if (fileExists(input)) return input;
+    }
+    return "";
+}
+
+// The GPU's temperature sensor file, or "" if it has none. AMD cards report
+// "edge" (the chip's surface, which is what most tools show), "junction" (its
+// hottest spot) and "mem"; others have a single input.
+std::string findHwmonTemperatureInput(const std::string& deviceDir) {
+    for (const fs::path& hwmon : listDirectory(deviceDir + "/hwmon")) {
+        std::string first;
+        for (int i = 1; i <= 8; ++i) {
+            const std::string input = format("%s/temp%d_input", hwmon.string().c_str(), i);
+            if (!fileExists(input)) continue;
+            if (readFirstLine(format("%s/temp%d_label", hwmon.string().c_str(), i)) == "edge") return input;
+            if (first.empty()) first = input;
+        }
+        if (!first.empty()) return first;
     }
     return "";
 }
@@ -1114,7 +1202,7 @@ GpuStats pickBusiest(const std::vector<GpuStats>& candidates) {
 struct AmdCard {
     std::string name{"AMD Radeon GPU"};
     double vramTotalGb{0.0};
-    std::string busyPath, vramUsedPath, clockPath, voltagePath;
+    std::string busyPath, vramUsedPath, clockPath, voltagePath, temperaturePath;
 };
 
 std::vector<AmdCard> findAmdCards(const std::string& sysRoot) {
@@ -1128,6 +1216,7 @@ std::vector<AmdCard> findAmdCards(const std::string& sysRoot) {
         card.vramUsedPath = dir + "/mem_info_vram_used";
         card.clockPath    = dir + "/pp_dpm_sclk";
         card.voltagePath  = findHwmonVoltageInput(dir);
+        card.temperaturePath = findHwmonTemperatureInput(dir);
 
         std::string name = readFirstLine(dir + "/product_name");
         if (name.empty()) name = lookupPciDeviceName(kAmdVendorId, readFirstLine(dir + "/device"));
@@ -1169,6 +1258,7 @@ GpuStats readAmdCard(const AmdCard& card) {
     });
 
     gpu.voltageV = readVoltage(card.voltagePath);
+    gpu.temperatureC = readTemperature(card.temperaturePath);
     return gpu;
 }
 
@@ -1189,6 +1279,7 @@ struct IntelCard {
     std::vector<std::string> clockPaths;   // current clock in MHz, best source first
     std::string idleCounterPath;           // total milliseconds spent asleep so far
     std::string voltagePath;
+    std::string temperaturePath;           // graphics cards only: integrated GPUs share the CPU's
 
     // The previous reading, needed to turn the running total into a percentage.
     double lastIdleMs{0.0};
@@ -1224,6 +1315,7 @@ std::vector<IntelCard> findIntelCards(const std::string& sysRoot) {
             cardDir + "/gt/gt0/rc6_residency_ms", cardDir + "/power/rc6_residency_ms",   // i915
             dir + "/tile0/gt0/gtidle/idle_residency_ms"});                               // xe
         card.voltagePath = findHwmonVoltageInput(dir);
+        card.temperaturePath = findHwmonTemperatureInput(dir);
 
         cards.push_back(card);
     }
@@ -1236,6 +1328,7 @@ GpuStats readIntelCard(IntelCard& card) {
     gpu.name = card.name;
     gpu.memoryNote = card.memoryNote;
     gpu.voltageV = readVoltage(card.voltagePath);
+    gpu.temperatureC = readTemperature(card.temperaturePath);
 
     for (const std::string& path : card.clockPaths) {   // a reading of 0 means "asleep right now", so try the next file
         double mhz = 0.0;
@@ -1285,6 +1378,7 @@ struct MaliGpu {
     std::string name{"ARM Mali GPU"};
     std::string clockPath;   // devfreq "cur_freq", in Hz
     std::string loadPath;    // a file holding the load percent, or "" if there is none
+    std::string temperaturePath;   // a thermal zone, or ""
 };
 
 // True if the device folder belongs to a Mali GPU (by driver name or device tree).
@@ -1340,6 +1434,7 @@ std::optional<MaliGpu> findMaliGpu(const std::string& sysRoot) {
         loadCandidates.insert(loadCandidates.begin(), devfreqDir + "/load");
     }
     gpu.loadPath = firstExisting(loadCandidates);
+    gpu.temperaturePath = findThermalZone(sysRoot, {"gpu"});
     return gpu;
 }
 
@@ -1348,6 +1443,7 @@ GpuStats readMaliGpu(const MaliGpu& mali) {
     gpu.vendor = GpuVendor::Mali;
     gpu.name = mali.name;
     gpu.memoryNote = "VRAM: shares system RAM";
+    gpu.temperatureC = readTemperature(mali.temperaturePath);
 
     double value = 0.0;
     if (!mali.clockPath.empty() && readNumber(mali.clockPath, value)) gpu.clockGhz = value / 1e9;   // devfreq reports Hz
@@ -1471,7 +1567,8 @@ class LiveMonitor {
 public:
     // `refreshMs` is the update interval (see GpuMonitor).
     explicit LiveMonitor(int refreshMs)
-        : previousCpu_(readCpuTimes()), cpuVoltageInputs_(findCpuVoltageInputs()), gpu_(refreshMs) {
+        : previousCpu_(readCpuTimes()), cpuVoltageInputs_(findCpuVoltageInputs()),
+          cpuTemperatureInput_(findCpuTemperatureInput()), gpu_(refreshMs) {
         stats_.cpuPercent.assign(previousCpu_.size(), 0.0f);
         readSensors();   // everything except CPU load, which needs two samples
     }
@@ -1505,6 +1602,7 @@ private:
         stats_.ram        = readRamStats();
         stats_.gpu        = gpu_.read();
         stats_.cpuFreqGhz = readCpuFreqGhz();
+        stats_.cpuTemperatureC = readTemperature(cpuTemperatureInput_);
         stats_.uptime     = readUptime();
 
         const double now = monotonicMs();
@@ -1517,6 +1615,7 @@ private:
     std::vector<CpuTimes> previousCpu_;
     std::vector<std::string> cpuVoltageInputs_;
     double lastVoltageReadMs_{-1.0};   // -1 = not read yet
+    std::string cpuTemperatureInput_;
     GpuMonitor gpu_;
     LiveStats stats_;
 };
@@ -1594,7 +1693,7 @@ std::vector<DiskUsage> readDiskUsage() {
 
 // ---- Settings --------------------------------------------------------------
 
-enum class Skin { Classic, Jarv, Galactic, Gunship, Halloween };
+enum class Skin { Classic, Jarv, Galactic, Gunship, Halloween, Poseidon, Otaku, Cyberpunk, Gnome };
 
 // Every skin, in the order the Skin dropdown lists them. `id` is how
 // settings.conf stores it; `name` is what the dropdown shows.
@@ -1609,6 +1708,10 @@ constexpr SkinChoice kSkinChoices[] = {
     {Skin::Galactic, "galactic", "Galactic Conflict"},
     {Skin::Gunship,  "gunship",  "Federation Gunship"},
     {Skin::Halloween, "halloween", "Halloween"},
+    {Skin::Poseidon,  "poseidon",  "Poseidon"},
+    {Skin::Otaku,     "otaku",     "Otaku"},
+    {Skin::Cyberpunk, "cyberpunk", "Cyber-Punk"},
+    {Skin::Gnome,     "gnome",     "Classroom"},
 };
 
 const SkinChoice& skinChoice(Skin skin) {
@@ -1626,11 +1729,14 @@ struct Settings {
     int refreshMs{kDefaultRefreshMs};
     bool runInBackground{false};   // closing the window hides it, so the overlay hotkey keeps working
     bool limitOverlayToApp{true};  // the overlay opens only on a focused app, and lives and dies with it
+    bool fahrenheit{false};        // temperatures in °F instead of °C
+    bool borderless{false};        // the window has no title bar or border
 };
 
 bool operator!=(const Settings& a, const Settings& b) {
     return a.skin != b.skin || a.animations != b.animations || a.refreshMs != b.refreshMs ||
-           a.runInBackground != b.runInBackground || a.limitOverlayToApp != b.limitOverlayToApp;
+           a.runInBackground != b.runInBackground || a.limitOverlayToApp != b.limitOverlayToApp || a.fahrenheit != b.fahrenheit ||
+           a.borderless != b.borderless;
 }
 
 std::string settingsFilePath() {
@@ -1655,6 +1761,8 @@ Settings loadSettings() {
         else if (text == "animations=0") settings.animations = false;
         else if (text == "background=1") settings.runInBackground = true;
         else if (text == "limit_overlay=0") settings.limitOverlayToApp = false;
+        else if (text == "fahrenheit=1") settings.fahrenheit = true;
+        else if (text == "borderless=1") settings.borderless = true;
         else if (startsWith(text, "refresh_ms=")) {
             const int ms = atoi(text.c_str() + strlen("refresh_ms="));
             if (std::find(std::begin(kRefreshChoicesMs), std::end(kRefreshChoicesMs), ms) != std::end(kRefreshChoicesMs)) {
@@ -1673,9 +1781,10 @@ void saveSettings(const Settings& settings) {
     fs::create_directories(fs::path(path).parent_path(), error);
     FILE* file = fopen(path.c_str(), "w");
     if (!file) return;
-    fprintf(file, "skin=%s\nanimations=%d\nrefresh_ms=%d\nbackground=%d\nlimit_overlay=%d\n",
+    fprintf(file, "skin=%s\nanimations=%d\nrefresh_ms=%d\nbackground=%d\nlimit_overlay=%d\nfahrenheit=%d\nborderless=%d\n",
             skinChoice(settings.skin).id, settings.animations ? 1 : 0, settings.refreshMs,
-            settings.runInBackground ? 1 : 0, settings.limitOverlayToApp ? 1 : 0);
+            settings.runInBackground ? 1 : 0, settings.limitOverlayToApp ? 1 : 0, settings.fahrenheit ? 1 : 0,
+            settings.borderless ? 1 : 0);
     fclose(file);
 }
 
@@ -1709,7 +1818,22 @@ const ImVec4 kGpuHeading  (0.90f, 0.40f, 0.90f, 1.0f);
 const ImVec4 kInfoHeading (0.20f, 0.85f, 0.60f, 1.0f);
 const ImVec4 kClockColor  (0.20f, 0.85f, 0.40f, 1.0f);
 const ImVec4 kVoltageColor(0.30f, 0.90f, 0.90f, 1.0f);
+const ImVec4 kTemperatureColor(0.95f, 0.85f, 0.55f, 1.0f);   // below kHotC
 const ImVec4 kErrorColor  (0.90f, 0.30f, 0.30f, 1.0f);
+
+// Temperatures from here up are shown as hot (orange), then too hot (red).
+constexpr double kHotC = 80.0, kTooHotC = 90.0;
+
+const ImVec4& temperatureColor(double celsius) {
+    return celsius >= kTooHotC ? kRed : celsius >= kHotC ? kOrange : kTemperatureColor;
+}
+
+// "62°C" or "144°F" from a reading in °C, or "N/A" without a sensor (0).
+std::string temperatureText(double celsius, bool fahrenheit) {
+    constexpr const char* kDegree = "\xC2\xB0";   // "°" in UTF-8
+    if (celsius <= 0.0) return "N/A";
+    return fahrenheit ? format("%.0f%sF", celsius * 9.0 / 5.0 + 32.0, kDegree) : format("%.0f%sC", celsius, kDegree);
+}
 
 // Green, then orange above warnAt and red above critAt (fractions, 0..1).
 const ImVec4& usageColor(float percent, float warnAt, float critAt) {
@@ -1727,8 +1851,8 @@ void drawUsageBar(const char* label, float percent, const std::string& text, flo
     ImGui::PopStyleColor();
 }
 
-// "3.20 GHz | 1.100 V", or greyed-out "N/A" placeholders when a sensor is missing.
-void drawClockAndVoltage(double clockGhz, double volts, const char* voltageName) {
+// "3.20 GHz | 1.100 V | 62°C", or greyed-out "N/A" placeholders when a sensor is missing.
+void drawSensorLine(double clockGhz, double volts, const char* voltageName, double celsius, bool fahrenheit) {
     if (clockGhz > 0.0) ImGui::TextColored(kClockColor, "%.2f GHz", clockGhz);
     else                ImGui::TextDisabled("Clock: N/A");
 
@@ -1738,6 +1862,13 @@ void drawClockAndVoltage(double clockGhz, double volts, const char* voltageName)
 
     if (volts > 0.0) ImGui::TextColored(kVoltageColor, "%.3f V", volts);
     else             ImGui::TextDisabled("%s: N/A", voltageName);
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+
+    if (celsius > 0.0) ImGui::TextColored(temperatureColor(celsius), "%s", temperatureText(celsius, fahrenheit).c_str());
+    else               ImGui::TextDisabled("Temp: N/A");
 }
 
 // A two-column "Property | Value" table. Returns false if it can't be shown;
@@ -1757,10 +1888,10 @@ void drawInfoRow(const char* label, const std::string& value) {
     ImGui::TextWrapped("%s", value.c_str());
 }
 
-void drawCpuSection(const StaticInfo& info, const LiveStats& live) {
+void drawCpuSection(const StaticInfo& info, const LiveStats& live, bool fahrenheit) {
     ImGui::TextColored(kCpuHeading, "Per-Core CPU Load");
     ImGui::TextWrapped("%s", info.cpuModel.c_str());
-    drawClockAndVoltage(live.cpuFreqGhz, live.cpuVoltage, "VCore");
+    drawSensorLine(live.cpuFreqGhz, live.cpuVoltage, "VCore", live.cpuTemperatureC, fahrenheit);
     ImGui::Spacing();
 
     ImGui::BeginChild("CpuCoresRegion", ImVec2(0, 200), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
@@ -1806,12 +1937,12 @@ std::string vendorTag(GpuVendor vendor) {
     return vendor == GpuVendor::Unknown ? "" : format(" (%s)", vendorName(vendor));
 }
 
-void drawGpuSection(const LiveStats& live) {
+void drawGpuSection(const LiveStats& live, bool fahrenheit) {
     const GpuStats& gpu = live.gpu;
 
     ImGui::TextColored(kGpuHeading, "GPU Metrics%s", vendorTag(gpu.vendor).c_str());
     ImGui::TextWrapped("Card: %s", gpu.name.c_str());
-    drawClockAndVoltage(gpu.clockGhz, gpu.voltageV, "VDDC");
+    drawSensorLine(gpu.clockGhz, gpu.voltageV, "VDDC", gpu.temperatureC, fahrenheit);
     ImGui::Spacing();
 
     if (!gpu.hasLoad && !gpu.hasMemory && gpu.loadNote.empty()) {
@@ -1989,6 +2120,11 @@ void drawSettingsMenu(UiState& ui, const ImVec2& gearMin, const ImVec2& gearMax)
     ImGui::Separator();
     ImGui::TextDisabled("Update Interval");
     drawIntervalPicker(ui.settings.refreshMs);
+
+    ImGui::Separator();
+    if (ImGui::RadioButton("Display Temperature in \xC2\xB0" "F", ui.settings.fahrenheit)) ui.settings.fahrenheit = !ui.settings.fahrenheit;
+    if (ImGui::RadioButton("Borderless", ui.settings.borderless)) ui.settings.borderless = !ui.settings.borderless;
+    ImGui::SetItemTooltip("Hide Window Borders");
 
     ImGui::Separator();
     ImGui::TextDisabled("Overlay (Ctrl+Shift+O)");
@@ -2179,14 +2315,14 @@ void drawDashboard(const ImVec2& windowSize, UiState& ui, const StaticInfo& info
 
     if (ImGui::BeginTable("PerformanceTable", 2, columnFlags)) {
         ImGui::TableNextColumn();   // left: CPU + RAM
-        drawCpuSection(info, live);
+        drawCpuSection(info, live, ui.settings.fahrenheit);
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
         drawRamSection(info, live);
 
         ImGui::TableNextColumn();   // right: GPU
-        drawGpuSection(live);
+        drawGpuSection(live, ui.settings.fahrenheit);
         ImGui::EndTable();
     }
 
@@ -2209,7 +2345,7 @@ void drawDashboard(const ImVec2& windowSize, UiState& ui, const StaticInfo& info
 }
 
 // ============================================================================
-// 6. HUD SKINS (JARV, GALACTIC CONFLICT, FEDERATION GUNSHIP, HALLOWEEN)
+// 6. HUD SKINS (JARV, GALACTIC CONFLICT, FEDERATION GUNSHIP, HALLOWEEN, POSEIDON, OTAKU, CYBER-PUNK, CLASSROOM)
 // ============================================================================
 // These skins share one layout: a header, four gauges, then two rows of panels
 // (CPU cores + graphics, hardware + operating system). Each skin supplies the
@@ -2268,6 +2404,7 @@ struct HudState {
     ImFont* textFont{nullptr};      // labels and values
     ImFont* displayFont{nullptr};   // headings and big numbers
     bool animate{true};
+    bool fahrenheit{false};         // temperatures in °F
     float time{0.0f};               // seconds; drives the moving parts (stays 0 when not animating)
     // The numbers as currently drawn. While animating they glide towards the
     // live values instead of jumping.
@@ -2303,17 +2440,23 @@ struct GaugeReading {
     std::string line1, line2;   // readouts under the gauge
 };
 
+// "4.86 GHz · 62°C": the clock, and the temperature when there is a sensor.
+std::string clockAndTemperature(double clockGhz, double celsius, bool fahrenheit) {
+    const std::string clock = clockGhz > 0.0 ? format("%.2f GHz", clockGhz) : "CLOCK N/A";
+    return celsius > 0.0 ? clock + " \xC2\xB7 " + temperatureText(celsius, fahrenheit) : clock;
+}
+
 std::array<GaugeReading, 4> gaugeReadings(const HudState& state, const LiveStats& live) {
     const GpuStats& gpu = live.gpu;
     const bool gpuReports = gpu.hasLoad || gpu.hasMemory || !gpu.loadNote.empty();
     return {{
         {"CPU", state.cpu, !live.cpuPercent.empty(), 0.50f, 0.80f,
-         live.cpuFreqGhz > 0.0 ? format("%.2f GHz", live.cpuFreqGhz) : "CLOCK N/A",
+         clockAndTemperature(live.cpuFreqGhz, live.cpuTemperatureC, state.fahrenheit),
          live.cpuVoltage > 0.0 ? format("VCORE %.3f V", live.cpuVoltage) : "VCORE N/A"},
         {"MEMORY", state.ram, live.ram.totalGb > 0.0, 0.65f, 0.85f,
          format("%.1f / %.1f GB", live.ram.usedGb, live.ram.totalGb), "SYSTEM RAM"},
         {gpu.loadIsEstimate ? "GPU (EST.)" : "GPU", state.gpu, gpu.hasLoad, 0.50f, 0.85f,
-         gpu.clockGhz > 0.0 ? format("%.2f GHz", gpu.clockGhz) : "CLOCK N/A",
+         clockAndTemperature(gpu.clockGhz, gpu.temperatureC, state.fahrenheit),
          !gpuReports         ? "STATS UNAVAILABLE"
          : !gpu.hasLoad      ? noteValue(gpu.loadNote)
          : gpu.voltageV > 0.0 ? format("VDDC %.3f V", gpu.voltageV) : "VDDC N/A"},
@@ -2387,11 +2530,12 @@ bool beginHudInfoTable(const HudSkin& skin, const char* id, float width, std::in
 void drawHudGpuPanel(const HudSkin& skin, ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
     const GpuStats& gpu = live.gpu;
     beginHudPanel(skin.panelFrame(draw, box, "GRAPHICS", state), "##HudGpu");
-    if (beginHudInfoTable(skin, "HudGpuTable", skin.labelColumns.graphics, {"MODEL", "VENDOR", "CLOCK", "VDDC", "LOAD", "VRAM"})) {
+    if (beginHudInfoTable(skin, "HudGpuTable", skin.labelColumns.graphics, {"MODEL", "VENDOR", "CLOCK", "VDDC", "TEMP", "LOAD", "VRAM"})) {
         skin.infoRow(state, "MODEL", gpu.name);
         skin.infoRow(state, "VENDOR", vendorName(gpu.vendor));
         skin.infoRow(state, "CLOCK", gpu.clockGhz > 0.0 ? format("%.2f GHz", gpu.clockGhz) : "N/A");
         skin.infoRow(state, "VDDC", gpu.voltageV > 0.0 ? format("%.3f V", gpu.voltageV) : "N/A");
+        skin.infoRow(state, "TEMP", temperatureText(gpu.temperatureC, state.fahrenheit));
         skin.infoRow(state, "LOAD", gpu.hasLoad ? format("%.1f%%%s", gpu.gpuUsage, gpu.loadIsEstimate ? " (estimated)" : "")
                                                : gpu.loadNote.empty() ? "N/A" : noteValue(gpu.loadNote));
         skin.infoRow(state, "VRAM", gpu.hasMemory ? format("%.2f / %.2f GB", gpu.vramUsedGb, gpu.vramTotalGb)
@@ -2439,6 +2583,7 @@ void drawHudDashboard(const ImVec2& windowSize, UiState& ui, const HudSkin& skin
     state.textFont = skin.textFont;
     state.displayFont = skin.displayFont;
     state.animate = ui.settings.animations;
+    state.fahrenheit = ui.settings.fahrenheit;
     state.time = state.animate ? static_cast<float>(ImGui::GetTime()) : 0.0f;
     glideHudValues(state, live);
     skin.background(windowSize, state);
@@ -3905,6 +4050,1322 @@ void applyHalloweenStyle(ImGuiStyle& style) {
     colors[ImGuiCol_NavCursor]            = kHwOrange;
 }
 
+// ---- Poseidon -------------------------------------------------------------------
+// The sea god's temple: deep stormy blues, gold trim with Greek key borders,
+// carved Roman capitals and marble-white numbers. The gauges are round bronze
+// shields with a trident pointing at the value, the cores a colonnade of
+// temple columns filling with sea water, and lightning forks across the sky.
+
+const ImVec4 kPoGold      (0.86f, 0.68f, 0.32f, 1.0f);    // trim, titles, labels; busy
+const ImVec4 kPoMarble    (0.93f, 0.95f, 0.97f, 1.0f);    // values
+const ImVec4 kPoFoam      (0.62f, 0.78f, 0.86f, 1.0f);    // quiet text
+const ImVec4 kPoSea       (0.22f, 0.74f, 0.84f, 1.0f);    // water; relaxed
+const ImVec4 kPoBolt      (0.74f, 0.93f, 1.00f, 1.0f);    // lightning
+const ImVec4 kPoClay      (0.90f, 0.42f, 0.22f, 1.0f);    // critical: the terracotta of Greek pottery
+const ImVec4 kPoPanel     (0.03f, 0.09f, 0.16f, 1.0f);    // panel fill
+const ImVec4 kPoDeepTop   (0.05f, 0.14f, 0.23f, 1.0f);    // background, top...
+const ImVec4 kPoDeepBottom(0.01f, 0.04f, 0.08f, 1.0f);    // ...and bottom
+
+// Sea blue when relaxed, gold when busy, terracotta when critical.
+const ImVec4& poseidonLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kPoClay : (fraction > warnAt) ? kPoGold : kPoSea;
+}
+
+// A Greek key (meander) band from x0 to x1, as painted round the rim of Greek
+// pottery: square hooks of `height` on a shared baseline.
+void drawGreekKey(ImDrawList* draw, float x0, float x1, float top, float height, ImU32 color) {
+    const float bottom = std::floor(top + height) + 0.5f;
+    top = std::floor(top) + 0.5f;
+    draw->AddLine(ImVec2(x0, bottom), ImVec2(x1, bottom), color);
+    for (float x = std::floor(x0) + 0.5f; x + height <= x1; x += height) {
+        const ImVec2 hook[] = {ImVec2(x, bottom), ImVec2(x, top), ImVec2(std::floor(x + height * 0.78f), top),
+                               ImVec2(std::floor(x + height * 0.78f), std::floor(top + height * 0.62f)),
+                               ImVec2(std::floor(x + height * 0.39f), std::floor(top + height * 0.62f)),
+                               ImVec2(std::floor(x + height * 0.39f), std::floor(top + height * 0.32f))};
+        draw->AddPolyline(hook, 6, color, ImDrawFlags_None, 1.0f);
+    }
+}
+
+// A jagged path from `a` to `b` (appended to `points`, without `a`), made by
+// midpoint displacement: each stretch is halved and its middle pushed sideways
+// by a random share of its length, then each half again, so the line zig-zags
+// at every scale the way real lightning does. `seed` advances as it is used.
+void lightningPath(std::vector<ImVec2>& points, const ImVec2& a, const ImVec2& b, int depth, int& seed) {
+    if (depth == 0) {
+        points.push_back(b);
+        return;
+    }
+    const ImVec2 along = b - a;
+    const ImVec2 sideways(-along.y, along.x);   // as long as `along`
+    const ImVec2 middle = (a + b) * 0.5f + sideways * ((hash01(seed++) - 0.5f) * 0.45f);
+    lightningPath(points, a, middle, depth - 1, seed);
+    lightningPath(points, middle, b, depth - 1, seed);
+}
+
+// Strokes a bolt's path, thinning towards its end: a wide faint blue glow, a
+// brighter blue body, and a white-hot core.
+void strokeBolt(ImDrawList* draw, const std::vector<ImVec2>& points, float width, float alpha) {
+    const size_t segments = points.size() - 1;
+    for (size_t i = 0; i < segments; ++i) {
+        const float taper = 1.0f - 0.65f * static_cast<float>(i) / static_cast<float>(segments);
+        const float w = width * taper;
+        draw->AddLine(points[i], points[i + 1], withAlpha(kPoBolt, 0.05f * alpha), w * 9.0f);
+        draw->AddLine(points[i], points[i + 1], withAlpha(kPoBolt, 0.14f * alpha), w * 4.0f);
+        draw->AddLine(points[i], points[i + 1], withAlpha(kPoBolt, 0.55f * alpha), w * 2.0f);
+        draw->AddLine(points[i], points[i + 1], withAlpha(ImVec4(1, 1, 1, 1), alpha), w);
+    }
+}
+
+// A lightning bolt from `from` towards `to`, with a few thinner forks
+// splitting off it, and a glow where it starts. `seed` picks its shape.
+void drawLightning(ImDrawList* draw, const ImVec2& from, const ImVec2& to, int seed, float alpha, float width = 2.2f) {
+    int next = seed * 977;
+    std::vector<ImVec2> bolt = {from};
+    lightningPath(bolt, from, to, 6, next);   // 64 segments
+
+    for (int glow = 3; glow >= 1; --glow) {   // the lit cloud it comes out of
+        draw->AddCircleFilled(from, width * 9.0f * static_cast<float>(glow), withAlpha(kPoBolt, 0.035f * alpha));
+    }
+    const ImVec2 along = to - from;
+    for (int fork = 0; fork < 3; ++fork) {
+        const size_t at = 10 + static_cast<size_t>(hash01(next++) * 36.0f);   // where along the bolt it splits off
+        const float side = hash01(next++) < 0.5f ? -1.0f : 1.0f;
+        const float turn = side * (0.35f + 0.5f * hash01(next++));
+        const float length = 0.18f + 0.20f * hash01(next++);
+        const ImVec2 direction(along.x * cosf(turn) - along.y * sinf(turn), along.x * sinf(turn) + along.y * cosf(turn));
+        std::vector<ImVec2> branch = {bolt[at]};
+        lightningPath(branch, bolt[at], bolt[at] + direction * length, 4, next);
+        strokeBolt(draw, branch, width * 0.45f, alpha * 0.8f);
+    }
+    strokeBolt(draw, bolt, width, alpha);
+}
+
+// A stormy deep-sea gradient, slow swells along the bottom, a faint bolt far
+// off in the corner and, while animating, a bolt that strikes every few seconds.
+void drawPoseidonBackground(const ImVec2& size, const HudState& state) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    const ImU32 top = withAlpha(kPoDeepTop, 1.0f), bottom = withAlpha(kPoDeepBottom, 1.0f);
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), size, top, top, bottom, bottom);
+
+    for (int row = 0; row < 4; ++row) {
+        const float baseY = size.y - 16.0f - static_cast<float>(row) * 24.0f;
+        for (float x = 0.0f; x <= size.x + 8.0f; x += 8.0f) {
+            draw->PathLineTo(ImVec2(x, baseY + sinf(x * 0.017f + state.time * 0.7f + static_cast<float>(row) * 1.9f) * 5.0f));
+        }
+        draw->PathStroke(withAlpha(kPoSea, 0.10f - 0.02f * static_cast<float>(row)), 1.5f);
+    }
+
+    drawLightning(draw, ImVec2(size.x * 0.99f, 56.0f), ImVec2(size.x * 0.955f, size.y * 0.58f), 11, 0.55f, 1.6f);   // far off, always there (below the header)
+    if (state.animate) {
+        constexpr float kEvery = 9.0f;
+        const float cycle = fmodf(state.time, kEvery);
+        if (cycle < 0.40f) {
+            const int strike = static_cast<int>(state.time / kEvery);
+            const float alpha = cycle < 0.06f ? 1.0f : cycle < 0.12f ? 0.25f : cycle < 0.20f ? 0.9f : (0.40f - cycle) / 0.20f * 0.6f;
+            draw->AddRectFilled(ImVec2(0.0f, 0.0f), size, withAlpha(kPoBolt, 0.035f * alpha));
+            const float x = size.x * (0.10f + 0.80f * hash01(strike));
+            drawLightning(draw, ImVec2(x, 0.0f), ImVec2(x + (hash01(strike + 5) - 0.5f) * 260.0f, size.y * (0.35f + 0.3f * hash01(strike + 9))),
+                          strike, alpha);
+        }
+    }
+}
+
+// A dark panel with a gold double border, small gold diamonds at the corners
+// and a Greek key band beside the title. Returns the area for content.
+Box drawPoseidonPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    constexpr float kHeader = 26.0f;
+    draw->AddRectFilled(box.min, box.max, withAlpha(kPoPanel, 0.84f), 3.0f);
+    draw->AddRect(box.min, box.max, withAlpha(kPoGold, 0.85f), 3.0f, 0, 1.0f);
+    draw->AddRect(box.min + ImVec2(3.0f, 3.0f), box.max - ImVec2(3.0f, 3.0f), withAlpha(kPoGold, 0.30f), 2.0f, 0, 1.0f);
+    for (const ImVec2& corner : {box.min, ImVec2(box.max.x, box.min.y), box.max, ImVec2(box.min.x, box.max.y)}) {
+        draw->AddQuadFilled(corner + ImVec2(0, -4), corner + ImVec2(4, 0), corner + ImVec2(0, 4), corner + ImVec2(-4, 0), withAlpha(kPoGold, 1.0f));
+    }
+
+    constexpr float kTitleSize = 12.0f;
+    const ImVec2 titleExtent = textSize(state.displayFont, kTitleSize, title);
+    const float titleY = std::floor(box.min.y + (kHeader - titleExtent.y) * 0.5f + 1.0f);
+    draw->AddText(state.displayFont, kTitleSize, ImVec2(box.min.x + 14.0f, titleY), withAlpha(kPoGold, 1.0f), title.c_str());
+    drawGreekKey(draw, box.min.x + 26.0f + titleExtent.x, box.max.x - 12.0f, box.min.y + 9.0f, 8.0f, withAlpha(kPoGold, 0.40f));
+    draw->AddLine(ImVec2(box.min.x + 6.0f, box.min.y + kHeader + 0.5f), ImVec2(box.max.x - 6.0f, box.min.y + kHeader + 0.5f),
+                  withAlpha(kPoGold, 0.25f));
+    return Box{ImVec2(box.min.x + 14.0f, box.min.y + kHeader + 8.0f), ImVec2(box.max.x - 10.0f, box.max.y - 10.0f)};
+}
+
+// "LABEL   value": the label in small gold capitals, the value in marble white.
+void drawPoseidonInfoRow(const HudState& state, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(state.displayFont, 10.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3.0f);   // line the small label up with the taller value
+    ImGui::TextColored(kPoGold, "%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// A small trident lying along the radius at `angle`, prongs outwards.
+void drawTrident(ImDrawList* draw, const ImVec2& center, float angle, float from, float to, ImU32 color) {
+    const ImVec2 out(cosf(angle), sinf(angle)), side(-out.y, out.x);
+    const float length = to - from;
+    const ImVec2 head = center + out * (from + length * 0.60f), tip = center + out * to;
+    const float spread = length * 0.24f;
+    draw->AddLine(center + out * from, tip, color, 2.0f);                              // shaft and middle prong
+    draw->AddLine(head - side * spread, head + side * spread, color, 2.0f);            // crossbar
+    for (const float s : {-1.0f, 1.0f}) {                                              // outer prongs
+        draw->AddLine(head + side * (spread * s), tip + side * (spread * s) - out * (length * 0.06f), color, 2.0f);
+    }
+}
+
+// A Greek galley in silhouette, sailing right: a long hull with a curled
+// stern and a ram at the bow, a mast with a square sail, oars, and two lines
+// of waves. Centred on `center`; `size` is half its length.
+void drawGalley(ImDrawList* draw, const ImVec2& center, float size, ImU32 color, ImU32 waveColor) {
+    const auto at = [&](float x, float y) { return ImVec2(center.x + x * size, center.y + y * size); };
+    const ImVec2 hull[] = {at(-0.98f, -0.42f), at(-0.86f, -0.40f), at(-0.80f, -0.12f), at(-0.62f, -0.04f), at(0.64f, -0.04f), at(0.78f, -0.16f),
+                           at(0.84f, -0.12f),  at(0.80f, 0.02f),   at(1.00f, 0.10f),   at(0.78f, 0.12f),   at(0.60f, 0.22f), at(-0.60f, 0.22f),
+                           at(-0.84f, 0.08f),  at(-0.92f, -0.18f)};
+    draw->AddConcavePolyFilled(hull, IM_ARRAYSIZE(hull), color);
+    draw->AddLine(at(0.0f, -0.04f), at(0.0f, -1.02f), color, std::max(size * 0.05f, 1.2f));         // mast
+    draw->AddLine(at(-0.44f, -0.92f), at(0.44f, -0.92f), color, std::max(size * 0.05f, 1.2f));      // yard
+    draw->AddQuadFilled(at(-0.40f, -0.90f), at(0.40f, -0.90f), at(0.34f, -0.22f), at(-0.34f, -0.22f), color);   // sail
+    for (const float x : {-0.13f, 0.13f}) draw->AddLine(at(x, -0.88f), at(x * 0.85f, -0.24f), waveColor, 1.0f);   // its seams
+    for (int i = 0; i < 6; ++i) {                                                                      // oars
+        const float x = -0.48f + 0.19f * static_cast<float>(i);
+        draw->AddLine(at(x, 0.18f), at(x - 0.14f, 0.42f), color, 1.0f);
+    }
+    for (int row = 0; row < 2; ++row) {                                                                // waves
+        const float y = 0.40f + 0.18f * static_cast<float>(row);
+        for (float x = -1.0f; x < 1.0f; x += 0.25f) {
+            draw->PathArcTo(at(x + 0.125f + 0.06f * static_cast<float>(row), y), size * 0.125f, kPi * 1.1f, kPi * 1.9f, 8);
+            draw->PathStroke(waveColor, ImDrawFlags_None, 1.0f);
+        }
+    }
+}
+
+// Black-figure silhouettes (as on Greek pottery) are built from rounded
+// strokes: `stroke` draws a thick line through `points` with round joints.
+void drawFigureStroke(ImDrawList* draw, std::initializer_list<ImVec2> points, float width, ImU32 color) {
+    const ImVec2* p = points.begin();
+    for (size_t i = 0; i + 1 < points.size(); ++i) draw->AddLine(p[i], p[i + 1], color, width);
+    for (const ImVec2& joint : points) draw->AddCircleFilled(joint, width * 0.5f, color);
+}
+
+// A trident with three barbed prongs, centred on `center` and tilted
+// `tilt` radians clockwise from upright. `size` is about half its length.
+void drawTridentEmblem(ImDrawList* draw, const ImVec2& center, float size, float tilt, ImU32 color) {
+    const float c = cosf(tilt), s = sinf(tilt);
+    const auto at = [&](float x, float y) {   // (0, 0) is the shaft's foot; the trident points up (-y) before tilting
+        y += 0.78f;                           // turn about its middle
+        return ImVec2(center.x + (x * c - y * s) * size, center.y + (x * s + y * c) * size);
+    };
+    const float w = std::max(size * 0.11f, 1.5f);
+    drawFigureStroke(draw, {at(0.0f, 0.0f), at(0.0f, -1.55f)}, w, color);                                // shaft and middle prong
+    drawFigureStroke(draw, {at(-0.34f, -1.40f), at(-0.34f, -1.05f), at(0.34f, -1.05f), at(0.34f, -1.40f)}, w, color);   // the fork
+    for (const float x : {-0.34f, 0.0f, 0.34f}) {                                                         // barbed tips
+        const float top = x == 0.0f ? -1.55f : -1.40f;
+        draw->AddTriangleFilled(at(x, top - 0.22f), at(x - 0.11f, top + 0.02f), at(x + 0.11f, top + 0.02f), color);
+    }
+    draw->AddCircleFilled(at(0.0f, -0.30f), w * 0.9f, color);                                            // a knot on the shaft
+}
+
+// A thunderbolt: the classic zig-zag, centred on `center` and tilted `tilt`
+// radians clockwise. `size` is half its length. `color` should be opaque, so
+// the two halves join without a seam.
+void drawThunderbolt(ImDrawList* draw, const ImVec2& center, float size, float tilt, ImU32 color) {
+    // The zig-zag already leans right (its tips are 0.46 apart across, 2 along),
+    // so turn it only by what is left of `tilt`.
+    const float turn = tilt - atanf(0.46f / 2.0f);
+    const float c = cosf(turn), s = sinf(turn);
+    const auto at = [&](float x, float y) { return ImVec2(center.x + (x * c - y * s) * size, center.y + (x * s + y * c) * size); };
+    // Drawn as two convex halves that meet along the middle; ImGui's filler for
+    // concave shapes mis-filled this one's sharp corners.
+    const ImVec2 upper[] = {at(0.22f, -1.0f), at(-0.34f, 0.10f), at(-0.03f, 0.10f), at(0.05f, -0.16f)};
+    const ImVec2 lower[] = {at(-0.03f, 0.10f), at(-0.24f, 1.0f), at(0.36f, -0.16f), at(0.05f, -0.16f)};
+    draw->AddConvexPolyFilled(upper, 4, color);
+    draw->AddConvexPolyFilled(lower, 4, color);
+}
+
+// A warrior with a round shield and a spear, riding a horse that rears up.
+// `ground` is under the horse's hind hooves; `size` is about its height.
+void drawHorseman(ImDrawList* draw, const ImVec2& ground, float size, ImU32 color) {
+    const auto at = [&](float x, float y) { return ImVec2(ground.x + x * size, ground.y + y * size); };
+    const float leg = std::max(size * 0.06f, 1.4f);
+    drawFigureStroke(draw, {at(-0.34f, -0.42f), at(-0.40f, -0.20f), at(-0.30f, 0.0f)}, leg, color);      // hind legs
+    drawFigureStroke(draw, {at(-0.27f, -0.42f), at(-0.20f, -0.20f), at(-0.12f, 0.0f)}, leg, color);
+    drawFigureStroke(draw, {at(-0.32f, -0.47f), at(0.20f, -0.74f)}, size * 0.22f, color);                // body
+    drawFigureStroke(draw, {at(0.18f, -0.76f), at(0.30f, -1.02f)}, size * 0.11f, color);                 // neck
+    drawFigureStroke(draw, {at(0.29f, -1.03f), at(0.45f, -0.97f)}, size * 0.09f, color);                 // head
+    draw->AddTriangleFilled(at(0.26f, -1.06f), at(0.30f, -1.16f), at(0.33f, -1.05f), color);             // ear
+    drawFigureStroke(draw, {at(0.22f, -0.68f), at(0.42f, -0.72f), at(0.40f, -0.54f)}, leg, color);       // front legs, kicking
+    drawFigureStroke(draw, {at(0.17f, -0.66f), at(0.34f, -0.58f), at(0.28f, -0.44f)}, leg, color);
+    drawFigureStroke(draw, {at(-0.44f, -0.50f), at(-0.54f, -0.36f), at(-0.56f, -0.24f)}, leg * 0.8f, color);   // tail
+
+    drawFigureStroke(draw, {at(-0.06f, -0.70f), at(-0.09f, -0.98f)}, size * 0.11f, color);              // rider
+    draw->AddCircleFilled(at(-0.09f, -1.08f), size * 0.07f, color);
+    draw->AddTriangleFilled(at(-0.16f, -1.10f), at(-0.09f, -1.24f), at(-0.02f, -1.12f), color);          // helmet crest
+    drawFigureStroke(draw, {at(-0.05f, -0.70f), at(0.07f, -0.60f), at(0.02f, -0.44f)}, leg, color);      // his leg
+    drawFigureStroke(draw, {at(-0.08f, -0.95f), at(0.06f, -1.02f)}, leg, color);                          // spear arm
+    draw->AddLine(at(-0.38f, -1.16f), at(0.62f, -0.88f), color, std::max(size * 0.03f, 1.2f));          // spear...
+    draw->AddTriangleFilled(at(0.72f, -0.85f), at(0.60f, -0.83f), at(0.62f, -0.92f), color);             // ...and its point
+    draw->AddCircleFilled(at(-0.15f, -0.84f), size * 0.12f, color);                                      // round shield
+}
+
+// A round bronze shield: a gold rim with ticks, a sea-blue track filling with
+// the load colour over 270 degrees, a trident at the value and the number
+// carved in the middle, and a small gold scene in the gap at the bottom (a
+// different one on each shield). The readouts sit under the shield.
+void drawPoseidonGauge(ImDrawList* draw, const ImVec2& center, float radius, const GaugeReading& reading, const HudState& state, int index) {
+    const float percent = std::clamp(reading.percent, 0.0f, 100.0f);
+    const float fraction = reading.hasValue ? percent / 100.0f : 0.0f;
+    const ImVec4& color = poseidonLoadColor(percent, reading.warnAt, reading.critAt);
+    constexpr float kStart = kPi * 0.75f, kSweep = kPi * 1.5f;
+
+    draw->AddCircleFilled(center, radius, withAlpha(kPoPanel, 0.90f), 64);
+    draw->AddCircle(center, radius, withAlpha(kPoGold, 0.90f), 64, 2.0f);
+    draw->AddCircle(center, radius - 4.0f, withAlpha(kPoGold, 0.30f), 64, 1.0f);
+    for (int i = 0; i <= 10; ++i) {
+        const float angle = kStart + kSweep * static_cast<float>(i) / 10.0f;
+        draw->AddLine(pointOnCircle(center, radius - 7.0f, angle), pointOnCircle(center, radius - (i % 5 == 0 ? 15.0f : 11.0f), angle),
+                      withAlpha(kPoGold, 0.70f), i % 5 == 0 ? 2.0f : 1.0f);
+    }
+
+    const float arcRadius = radius * 0.70f;
+    const float thickness = std::max(radius * 0.11f, 4.0f);
+    draw->PathArcTo(center, arcRadius, kStart, kStart + kSweep);
+    draw->PathStroke(withAlpha(kPoSea, 0.13f), thickness);
+    if (fraction > 0.0f) drawGlowArc(draw, center, arcRadius, kStart, kStart + kSweep * fraction, color, thickness);
+    if (reading.hasValue) {
+        drawTrident(draw, center, kStart + kSweep * fraction, arcRadius - thickness * 0.5f - 4.0f, radius - 3.0f, withAlpha(kPoMarble, 1.0f));
+    }
+
+    const float numberSize = std::round(radius * 0.36f);
+    if (reading.hasValue) {
+        const std::string number = format("%.0f", percent);
+        const float signSize = std::round(numberSize * 0.5f);
+        const ImVec2 numberExtent = textSize(state.displayFont, numberSize, number);
+        const ImVec2 signExtent = textSize(state.displayFont, signSize, "%");
+        const ImVec2 pos(std::floor(center.x - (numberExtent.x + signExtent.x + 2.0f) * 0.5f), std::floor(center.y - numberExtent.y * 0.62f));
+        draw->AddText(state.displayFont, numberSize, pos, withAlpha(kPoMarble, 1.0f), number.c_str());
+        draw->AddText(state.displayFont, signSize, ImVec2(pos.x + numberExtent.x + 2.0f, pos.y + numberExtent.y - signExtent.y - 3.0f),
+                      withAlpha(kPoGold, 1.0f), "%");
+    } else {
+        drawCenteredText(draw, state.displayFont, std::round(numberSize * 0.6f), ImVec2(center.x, center.y - numberSize * 0.2f),
+                         withAlpha(kPoFoam, 1.0f), "N/A");
+    }
+    drawCenteredText(draw, state.displayFont, std::max(std::round(radius * 0.11f), 9.0f), ImVec2(center.x, center.y + radius * 0.24f),
+                     withAlpha(kPoGold, 1.0f), reading.label);
+
+    const ImU32 gold = withAlpha(kPoGold, 0.85f);
+    const float ground = center.y + radius * 0.90f;
+    constexpr float kTilt = kPi * 35.0f / 180.0f;   // the trident and the thunderbolt lean right by this much
+    switch (index) {
+        case 0:  drawGalley(draw, ImVec2(center.x, center.y + radius * 0.66f), radius * 0.30f, gold, withAlpha(kPoSea, 0.8f)); break;
+        case 1:  drawTridentEmblem(draw, ImVec2(center.x, center.y + radius * 0.62f), radius * 0.255f, kTilt, gold); break;
+        case 2:  drawThunderbolt(draw, ImVec2(center.x, center.y + radius * 0.62f), radius * 0.255f * 0.89f, kTilt, withAlpha(kPoGold, 1.0f)); break;   // as long as the trident
+        default: drawHorseman(draw, ImVec2(center.x + radius * 0.03f, ground - radius * 0.03f), radius * 0.44f, gold); break;   // horse and rider centred; the spear reaches past
+    }
+
+    drawCenteredText(draw, state.textFont, 15.0f, ImVec2(center.x, center.y + radius + 14.0f), withAlpha(kPoMarble, 1.0f), reading.line1);
+    drawCenteredText(draw, state.textFont, 13.0f, ImVec2(center.x, center.y + radius + 31.0f), withAlpha(kPoFoam, 1.0f), reading.line2);
+}
+
+void drawPoseidonGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    const float columnWidth = box.width() / 4.0f;
+    const float radius = std::floor(std::min(columnWidth * 0.38f, (box.height() - 42.0f) * 0.5f));   // room underneath for the readouts
+    const float centerY = std::floor(box.min.y + radius + 2.0f);
+    for (int i = 0; i < 4; ++i) {
+        drawPoseidonGauge(draw, ImVec2(std::floor(box.min.x + columnWidth * (static_cast<float>(i) + 0.5f)), centerY), radius, readings[i], state, i);
+        if (i > 0) {   // between shields: a gold diamond
+            const ImVec2 c(std::floor(box.min.x + columnWidth * static_cast<float>(i)), centerY);
+            draw->AddQuadFilled(c + ImVec2(0, -6), c + ImVec2(6, 0), c + ImVec2(0, 6), c + ImVec2(-6, 0), withAlpha(kPoGold, 0.8f));
+        }
+    }
+}
+
+// The cores as a colonnade: temple columns on a stepped base, each filling
+// with sea water to its load. The water's surface sways while animating.
+void drawPoseidonCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawPoseidonPanelFrame(draw, box, format("COLONNADE \xC2\xB7 %zu THREADS", state.cores.size()), state), "##PoseidonCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    constexpr float kValueRow = 15.0f, kLabelRow = 14.0f, kStep = 6.0f;
+    const float floorY = std::floor(start.y + std::max(room.y - kLabelRow - kStep, kValueRow + 30.0f));
+    const float topY = start.y + kValueRow;
+    panel->AddRectFilled(ImVec2(start.x, floorY), ImVec2(start.x + room.x, floorY + 3.0f), withAlpha(kPoGold, 0.55f));   // the steps
+    panel->AddRectFilled(ImVec2(start.x + 6.0f, floorY + 3.0f), ImVec2(start.x + room.x - 6.0f, floorY + kStep), withAlpha(kPoGold, 0.25f));
+
+    const int count = static_cast<int>(state.cores.size());
+    const float slot = room.x / static_cast<float>(std::max(count, 1));
+    const float width = std::clamp(std::floor(slot * 0.52f), 4.0f, 22.0f);
+    for (int i = 0; i < count; ++i) {
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const float x = std::floor(start.x + slot * (static_cast<float>(i) + 0.5f));
+        const float capital = std::max(std::floor(width * 0.25f), 3.0f);
+        const Box shaft{ImVec2(x - width * 0.5f, topY + capital + 1.0f), ImVec2(x + width * 0.5f, floorY - capital)};
+
+        panel->AddRectFilled(shaft.min, shaft.max, withAlpha(kPoMarble, 0.10f));
+        const float surface = std::floor(shaft.max.y - shaft.height() * value / 100.0f);
+        const ImVec4& color = poseidonLoadColor(value, 0.50f, 0.80f);
+        if (value > 0.5f) {
+            panel->AddRectFilledMultiColor(ImVec2(shaft.min.x, surface), shaft.max, withAlpha(color, 0.85f), withAlpha(color, 0.85f),
+                                           withAlpha(color, 0.35f), withAlpha(color, 0.35f));
+            const float sway = sinf(state.time * 2.0f + static_cast<float>(i)) * 1.0f;
+            panel->AddLine(ImVec2(shaft.min.x, surface + sway), ImVec2(shaft.max.x, surface - sway), withAlpha(kPoMarble, 0.8f), 1.0f);
+        }
+        if (width >= 10.0f) {   // fluting
+            for (const float f : {-0.25f, 0.0f, 0.25f}) {
+                const float fx = std::floor(x + width * f) + 0.5f;
+                panel->AddLine(ImVec2(fx, shaft.min.y + 2.0f), ImVec2(fx, shaft.max.y - 2.0f), withAlpha(kPoPanel, 0.45f));
+            }
+        }
+        const float overhang = std::max(std::floor(width * 0.2f), 2.0f);
+        panel->AddRectFilled(ImVec2(shaft.min.x - overhang, topY), ImVec2(shaft.max.x + overhang, topY + capital), withAlpha(kPoGold, 0.9f));
+        panel->AddRectFilled(ImVec2(shaft.min.x - overhang, floorY - capital), ImVec2(shaft.max.x + overhang, floorY), withAlpha(kPoGold, 0.9f));
+
+        drawCenteredText(panel, state.displayFont, 8.0f, ImVec2(x, floorY + kStep + kLabelRow * 0.5f), withAlpha(kPoGold, 0.9f), format("%02d", i));
+        if (slot >= 22.0f) {
+            drawCenteredText(panel, state.textFont, 12.0f, ImVec2(x, start.y + kValueRow * 0.5f - 1.0f), withAlpha(kPoMarble, 0.9f),
+                             format("%.0f", value));
+        }
+    }
+    ImGui::Dummy(room);
+    ImGui::EndChild();
+}
+
+// A small lightning bolt, centred on `center`.
+void drawBoltIcon(ImDrawList* draw, const ImVec2& center, float size, ImU32 color) {
+    draw->AddTriangleFilled(center + ImVec2(size * 0.25f, -size), center + ImVec2(-size * 0.55f, size * 0.15f), center + ImVec2(size * 0.15f, size * 0.15f),
+                            color);
+    draw->AddTriangleFilled(center + ImVec2(-size * 0.15f, -size * 0.15f), center + ImVec2(size * 0.55f, -size * 0.15f),
+                            center + ImVec2(-size * 0.25f, size), color);
+}
+
+// The title in gold capitals with a soft glow, "ORACLE OF THE DEEP", a bolt
+// that flickers for "LIVE", the clock, and a Greek key band underneath.
+// Returns the buttons' rectangles.
+HeaderButtons drawPoseidonHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    ImFont* display = state.displayFont;
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 5.0f;
+
+    const ImVec2 titleExtent = textSize(display, 22.0f, "VEEASTATS");
+    drawGlowText(draw, display, 22.0f, ImVec2(box.min.x, midY - titleExtent.y * 0.5f), kPoGold, "VEEASTATS");
+    const ImVec2 subtitleExtent = textSize(state.textFont, 14.0f, "Oracle of the Deep");
+    draw->AddText(state.textFont, 14.0f, ImVec2(box.min.x + titleExtent.x + 14.0f, midY - subtitleExtent.y * 0.5f + 1.0f),
+                  withAlpha(kPoFoam, 1.0f), "Oracle of the Deep");
+
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    float right = buttons.storage.min.x - 18.0f;
+
+    std::string clock, date;
+    currentClock(clock, date);
+    const ImVec2 clockExtent = textSize(display, 16.0f, clock);
+    right -= clockExtent.x;
+    draw->AddText(display, 16.0f, ImVec2(right, midY - clockExtent.y * 0.5f), withAlpha(kPoMarble, 1.0f), clock.c_str());
+    const ImVec2 dateExtent = textSize(display, 9.0f, date);
+    right -= dateExtent.x + 12.0f;
+    draw->AddText(display, 9.0f, ImVec2(right, midY - dateExtent.y * 0.5f), withAlpha(kPoFoam, 1.0f), date.c_str());
+
+    // The bolt flickers now and then while animating.
+    const float flicker = (state.animate && fmodf(state.time, 3.1f) < 0.15f) ? 0.35f : 1.0f;
+    const ImVec2 liveExtent = textSize(display, 9.0f, "LIVE");
+    right -= liveExtent.x + 22.0f;
+    drawBoltIcon(draw, ImVec2(right - 6.0f, midY), 6.0f, withAlpha(kPoBolt, flicker));
+    draw->AddText(display, 9.0f, ImVec2(right + 3.0f, midY - liveExtent.y * 0.5f), withAlpha(kPoBolt, 1.0f), "LIVE");
+
+    drawGreekKey(draw, box.min.x, box.max.x, box.max.y - 9.0f, 7.0f, withAlpha(kPoGold, 0.55f));
+    return buttons;
+}
+
+void applyPoseidonStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.WindowRounding = style.PopupRounding = 3.0f;
+    style.ChildRounding = style.FrameRounding = style.ScrollbarRounding = style.GrabRounding = 2.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 8.0f;
+
+    auto gold = [](float alpha) { return ImVec4(kPoGold.x, kPoGold.y, kPoGold.z, alpha); };
+    auto sea = [](float alpha) { return ImVec4(kPoSea.x, kPoSea.y, kPoSea.z, alpha); };
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = kPoMarble;
+    colors[ImGuiCol_TextDisabled]         = kPoFoam;
+    colors[ImGuiCol_WindowBg]             = ImVec4(0.02f, 0.07f, 0.13f, 0.97f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(0.02f, 0.07f, 0.13f, 0.97f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = gold(0.55f);
+    colors[ImGuiCol_FrameBg]              = sea(0.10f);
+    colors[ImGuiCol_FrameBgHovered]       = sea(0.22f);
+    colors[ImGuiCol_FrameBgActive]        = sea(0.32f);
+    colors[ImGuiCol_Button]               = sea(0.14f);
+    colors[ImGuiCol_ButtonHovered]        = sea(0.28f);
+    colors[ImGuiCol_ButtonActive]         = sea(0.40f);
+    colors[ImGuiCol_Header]               = sea(0.22f);
+    colors[ImGuiCol_HeaderHovered]        = sea(0.32f);
+    colors[ImGuiCol_HeaderActive]         = sea(0.42f);
+    colors[ImGuiCol_CheckMark]            = kPoGold;
+    colors[ImGuiCol_Separator]            = gold(0.30f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = gold(0.30f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = gold(0.45f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = gold(0.60f);
+    colors[ImGuiCol_TextSelectedBg]       = sea(0.30f);
+    colors[ImGuiCol_NavCursor]            = kPoGold;
+}
+
+// ---- Otaku ----------------------------------------------------------------------
+// An anime mobile game's menus: a violet-to-pink sky with speed lines and
+// twinkling sparkles, deep navy cards with glowing teal edges, slanted ribbon
+// tabs, chunky outlined lettering and candy-coloured pill bars. The gauges are
+// tilted character cards and the cores a list of stat bars.
+
+const ImVec4 kOtNavy     (0.09f, 0.11f, 0.25f, 1.0f);   // cards
+const ImVec4 kOtTeal     (0.32f, 0.92f, 0.88f, 1.0f);   // card edges; relaxed
+const ImVec4 kOtPink     (1.00f, 0.40f, 0.68f, 1.0f);   // ribbons
+const ImVec4 kOtViolet   (0.58f, 0.44f, 1.00f, 1.0f);   // chips
+const ImVec4 kOtLemon    (1.00f, 0.84f, 0.30f, 1.0f);   // sparkles; busy
+const ImVec4 kOtRed      (1.00f, 0.32f, 0.44f, 1.0f);   // critical
+const ImVec4 kOtWhite    (1.00f, 1.00f, 1.00f, 1.0f);   // text
+const ImVec4 kOtLilac    (0.80f, 0.78f, 1.00f, 1.0f);   // quiet text
+const ImVec4 kOtInk      (0.11f, 0.06f, 0.24f, 1.0f);   // lettering outlines
+const ImVec4 kOtSkyTop   (0.27f, 0.20f, 0.60f, 1.0f);   // background, top...
+const ImVec4 kOtSkyBottom(0.60f, 0.24f, 0.52f, 1.0f);   // ...and bottom
+
+// Teal when relaxed, lemon when busy, red when critical.
+const ImVec4& otakuLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kOtRed : (fraction > warnAt) ? kOtLemon : kOtTeal;
+}
+
+// Text with a thick ink outline, like a mobile game's lettering.
+void drawInkText(ImDrawList* draw, ImFont* font, float size, const ImVec2& pos, ImU32 color, const std::string& text, float outline = 1.5f) {
+    for (int i = 0; i < 8; ++i) {
+        const float angle = kPi * 0.25f * static_cast<float>(i);
+        draw->AddText(font, size, pos + ImVec2(cosf(angle) * outline, sinf(angle) * outline), withAlpha(kOtInk, 1.0f), text.c_str());
+    }
+    draw->AddText(font, size, pos, color, text.c_str());
+}
+
+// A four-pointed sparkle.
+void drawSparkle(ImDrawList* draw, const ImVec2& c, float size, ImU32 color) {
+    const float waist = size * 0.26f;
+    draw->AddQuadFilled(c + ImVec2(0, -size), c + ImVec2(waist, 0), c + ImVec2(0, size), c + ImVec2(-waist, 0), color);
+    draw->AddQuadFilled(c + ImVec2(-size, 0), c + ImVec2(0, -waist), c + ImVec2(size, 0), c + ImVec2(0, waist), color);
+}
+
+// A pill-shaped bar: a dim track, the filled part in `color` with a glossy
+// highlight along its top.
+void drawPillBar(ImDrawList* draw, const Box& box, float percent, const ImVec4& color) {
+    const float rounding = box.height() * 0.5f;
+    draw->AddRectFilled(box.min, box.max, withAlpha(kOtWhite, 0.10f), rounding);
+    const float fill = std::floor(box.width() * std::clamp(percent, 0.0f, 100.0f) / 100.0f);
+    if (fill >= 2.0f) {
+        const ImVec2 end(box.min.x + std::max(fill, box.height()), box.max.y);
+        draw->AddRectFilled(box.min, end, withAlpha(color, 1.0f), rounding);
+        draw->AddRectFilled(ImVec2(box.min.x + rounding * 0.6f, box.min.y + 1.0f), ImVec2(end.x - rounding * 0.6f, box.min.y + box.height() * 0.38f),
+                            withAlpha(kOtWhite, 0.40f), rounding * 0.5f);
+    }
+    draw->AddRect(box.min, box.max, withAlpha(kOtInk, 0.9f), rounding, 0, 1.0f);
+}
+
+// A slanted ribbon tab with outlined lettering. Returns its width.
+float drawRibbon(ImDrawList* draw, ImFont* font, float size, const ImVec2& topLeft, float height, const ImVec4& color, const std::string& text) {
+    constexpr float kSlant = 8.0f;
+    const ImVec2 extent = textSize(font, size, text);
+    const float width = std::ceil(extent.x) + 26.0f;
+    const ImVec2 a(topLeft.x + kSlant, topLeft.y), b(topLeft.x + width + kSlant, topLeft.y), c(topLeft.x + width, topLeft.y + height),
+        d(topLeft.x, topLeft.y + height);
+    draw->AddQuadFilled(a, b, c, d, withAlpha(color, 1.0f));
+    draw->AddQuadFilled(a, b, ImVec2(b.x - kSlant * 0.4f, a.y + height * 0.4f), ImVec2(a.x - kSlant * 0.4f, a.y + height * 0.4f),
+                        withAlpha(kOtWhite, 0.22f));
+    draw->AddQuad(a, b, c, d, withAlpha(kOtInk, 0.9f), 1.5f);
+    drawInkText(draw, font, size, ImVec2(std::floor(topLeft.x + 13.0f + kSlant * 0.5f), std::floor(topLeft.y + (height - extent.y) * 0.5f)),
+                withAlpha(kOtWhite, 1.0f), text, 1.0f);
+    return width + kSlant;
+}
+
+// A violet-to-pink sky with faint diagonal speed lines and sparkles that
+// twinkle while animating.
+void drawOtakuBackground(const ImVec2& size, const HudState& state) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), size, withAlpha(kOtSkyTop, 1.0f), withAlpha(mix(kOtSkyTop, kOtSkyBottom, 0.35f), 1.0f),
+                                  withAlpha(kOtSkyBottom, 1.0f), withAlpha(mix(kOtSkyTop, kOtSkyBottom, 0.65f), 1.0f));
+    for (int i = 0; i < 28; ++i) {
+        const float x = std::fmod(hash01(i) * (size.x + 400.0f) + state.time * 30.0f, size.x + 400.0f) - 200.0f;
+        const float length = 80.0f + hash01(i + 50) * 220.0f;
+        draw->AddLine(ImVec2(x, size.y), ImVec2(x + length * 0.5f, size.y - length), withAlpha(kOtWhite, 0.03f + 0.04f * hash01(i + 90)),
+                      1.0f + std::floor(hash01(i + 70) * 3.0f));
+    }
+    for (int i = 0; i < 26; ++i) {
+        const ImVec2 at(hash01(i + 200) * size.x, hash01(i + 300) * size.y);
+        const float twinkle = state.animate ? 0.5f + 0.5f * sinf(state.time * 2.2f + static_cast<float>(i) * 1.7f) : 0.7f;
+        drawSparkle(draw, at, 2.0f + 4.0f * hash01(i + 400) * (0.6f + 0.4f * twinkle), withAlpha(i % 3 == 0 ? kOtLemon : kOtWhite, 0.15f + 0.35f * twinkle));
+    }
+}
+
+// A rounded navy card with a glowing teal edge, and a slanted pink ribbon tab
+// carrying the title across its top edge. Returns the area for content.
+Box drawOtakuPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    constexpr float kRounding = 12.0f, kTabHeight = 20.0f;
+    draw->AddRect(box.min - ImVec2(2, 2), box.max + ImVec2(2, 2), withAlpha(kOtTeal, 0.14f), kRounding + 2.0f, 0, 4.0f);
+    draw->AddRectFilled(box.min, box.max, withAlpha(kOtNavy, 0.94f), kRounding);
+    draw->AddRect(box.min, box.max, withAlpha(kOtTeal, 0.95f), kRounding, 0, 2.0f);
+    draw->AddRect(box.min + ImVec2(4, 4), box.max - ImVec2(4, 4), withAlpha(kOtTeal, 0.16f), kRounding - 4.0f, 0, 1.0f);
+
+    const float ribbon = drawRibbon(draw, state.displayFont, 11.0f, ImVec2(box.min.x + 16.0f, box.min.y - 7.0f), kTabHeight, kOtPink, title);
+    drawSparkle(draw, ImVec2(box.min.x + 16.0f + ribbon + 10.0f, box.min.y + 3.0f), 5.0f, withAlpha(kOtLemon, 1.0f));
+    return Box{ImVec2(box.min.x + 16.0f, box.min.y + kTabHeight + 2.0f), ImVec2(box.max.x - 12.0f, box.max.y - 10.0f)};
+}
+
+// "LABEL   value": the label in teal, the value in white.
+void drawOtakuInfoRow(const HudState& state, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(state.textFont, 12.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);   // line the small label up with the taller value
+    ImGui::TextColored(kOtTeal, "%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// One gauge as a tilted character card: a navy parallelogram with an edge in
+// the card's own colour, a name ribbon, the number in big outlined lettering,
+// a pill bar and the two readouts.
+void drawOtakuCard(ImDrawList* draw, const Box& box, const GaugeReading& reading, const ImVec4& identity, const HudState& state, int index) {
+    constexpr float kSlant = 16.0f;
+    const auto edgeX = [&](float y, bool right) {   // the slanted sides: x at height y
+        const float shift = kSlant * (1.0f - (y - box.min.y) / box.height());
+        return right ? box.max.x - kSlant + shift : box.min.x + shift;
+    };
+    const ImVec2 corners[] = {ImVec2(edgeX(box.min.y, false), box.min.y), ImVec2(edgeX(box.min.y, true), box.min.y),
+                              ImVec2(edgeX(box.max.y, true), box.max.y), ImVec2(edgeX(box.max.y, false), box.max.y)};
+    draw->AddQuad(corners[0], corners[1], corners[2], corners[3], withAlpha(identity, 0.16f), 6.0f);
+    draw->AddQuadFilled(corners[0], corners[1], corners[2], corners[3], withAlpha(kOtNavy, 0.95f));
+    const float bandBottom = box.min.y + box.height() * 0.30f;
+    draw->AddQuadFilled(corners[0], corners[1], ImVec2(edgeX(bandBottom, true), bandBottom), ImVec2(edgeX(bandBottom, false), bandBottom),
+                        withAlpha(identity, 0.20f));
+    draw->AddQuad(corners[0], corners[1], corners[2], corners[3], withAlpha(identity, 0.95f), 2.0f);
+
+    const float left = box.min.x + kSlant + 10.0f, right = box.max.x - kSlant - 6.0f;
+    drawRibbon(draw, state.displayFont, 11.0f, ImVec2(left - 4.0f, box.min.y + 10.0f), 20.0f, index == 3 ? kOtPink : identity,
+               reading.label);
+    const float twinkle = state.animate ? 0.6f + 0.4f * sinf(state.time * 3.0f + static_cast<float>(index) * 1.3f) : 1.0f;
+    drawSparkle(draw, ImVec2(box.max.x - 14.0f, box.min.y + 18.0f), 6.0f * twinkle, withAlpha(kOtLemon, 1.0f));
+    drawSparkle(draw, ImVec2(box.max.x - 26.0f, box.min.y + 30.0f), 3.0f, withAlpha(kOtWhite, 0.8f));
+
+    // The number, big, with its "%" in the card's colour.
+    const float numberSize = std::round(std::clamp(box.height() * 0.24f, 30.0f, 52.0f));
+    const float numberTop = std::floor(box.min.y + box.height() * 0.30f);
+    const float centerX = std::floor((left + right) * 0.5f);
+    if (reading.hasValue) {
+        const std::string number = format("%.0f", std::clamp(reading.percent, 0.0f, 100.0f));
+        const ImVec2 numberExtent = textSize(state.displayFont, numberSize, number);
+        const ImVec2 signExtent = textSize(state.displayFont, numberSize * 0.5f, "%");
+        const float x = std::floor(centerX - (numberExtent.x + signExtent.x + 3.0f) * 0.5f);
+        drawInkText(draw, state.displayFont, numberSize, ImVec2(x, numberTop), withAlpha(kOtWhite, 1.0f), number, 2.0f);
+        drawInkText(draw, state.displayFont, numberSize * 0.5f, ImVec2(x + numberExtent.x + 3.0f, numberTop + numberExtent.y - signExtent.y - 4.0f),
+                    withAlpha(identity, 1.0f), "%", 1.5f);
+    } else {
+        const ImVec2 extent = textSize(state.displayFont, numberSize * 0.6f, "N/A");
+        drawInkText(draw, state.displayFont, numberSize * 0.6f, ImVec2(centerX - extent.x * 0.5f, numberTop + numberSize * 0.2f),
+                    withAlpha(kOtLilac, 1.0f), "N/A", 1.5f);
+    }
+
+    const float barTop = std::floor(numberTop + numberSize * 1.30f);
+    drawPillBar(draw, Box{ImVec2(left, barTop), ImVec2(right, barTop + 12.0f)}, reading.hasValue ? reading.percent : 0.0f,
+                otakuLoadColor(reading.percent, reading.warnAt, reading.critAt));
+    drawCenteredText(draw, state.textFont, 14.0f, ImVec2(centerX, barTop + 28.0f), withAlpha(kOtWhite, 1.0f), reading.line1);
+    drawCenteredText(draw, state.textFont, 12.0f, ImVec2(centerX, barTop + 46.0f), withAlpha(kOtLilac, 1.0f), reading.line2);
+}
+
+void drawOtakuGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    static const ImVec4 kIdentities[] = {kOtTeal, kOtViolet, kOtPink, kOtLemon};
+    constexpr float kGap = 10.0f;
+    const float width = std::floor((box.width() - kGap * 3.0f) / 4.0f);
+    for (int i = 0; i < 4; ++i) {
+        const float x = box.min.x + static_cast<float>(i) * (width + kGap);
+        drawOtakuCard(draw, Box{ImVec2(x, box.min.y + 4.0f), ImVec2(x + width, box.max.y - 2.0f)}, readings[i], kIdentities[i], state, i);
+    }
+}
+
+// The cores as a game's stat list: a numbered chip, a pill bar and the
+// percentage, in as many columns as it takes to fit.
+void drawOtakuCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawOtakuPanelFrame(draw, box, format("CORES \xC2\xB7 %zu THREADS", state.cores.size()), state), "##OtakuCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    constexpr float kRowHeight = 19.0f, kColumnGap = 16.0f;
+    const int count = static_cast<int>(state.cores.size());
+    const int rowsThatFit = std::max(static_cast<int>(room.y / kRowHeight), 1);
+    const int columns = std::max((count + rowsThatFit - 1) / rowsThatFit, 1);
+    const int rows = (count + columns - 1) / columns;
+    const float columnWidth = (room.x - kColumnGap * static_cast<float>(columns - 1)) / static_cast<float>(columns);
+    for (int i = 0; i < count; ++i) {
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const float x = std::floor(start.x + static_cast<float>(i / rows) * (columnWidth + kColumnGap));
+        const float midY = std::floor(start.y + (static_cast<float>(i % rows) + 0.5f) * kRowHeight);
+
+        const Box chip{ImVec2(x, midY - 7.0f), ImVec2(x + 30.0f, midY + 7.0f)};
+        panel->AddRectFilled(chip.min, chip.max, withAlpha(kOtViolet, 0.9f), 7.0f);
+        drawCenteredText(panel, state.textFont, 11.0f, ImVec2((chip.min.x + chip.max.x) * 0.5f, midY), withAlpha(kOtWhite, 1.0f), format("C%02d", i));
+        const float barRight = x + columnWidth - 40.0f;
+        drawPillBar(panel, Box{ImVec2(chip.max.x + 6.0f, midY - 4.0f), ImVec2(barRight, midY + 5.0f)}, value, otakuLoadColor(value, 0.50f, 0.80f));
+        const std::string text = format("%.0f%%", value);
+        const ImVec2 extent = textSize(state.textFont, 13.0f, text);
+        panel->AddText(state.textFont, 13.0f, ImVec2(x + columnWidth - extent.x, midY - extent.y * 0.5f), withAlpha(kOtWhite, 1.0f), text.c_str());
+    }
+    ImGui::Dummy(room);
+    ImGui::EndChild();
+}
+
+// A heart, for "LIVE".
+void drawHeart(ImDrawList* draw, const ImVec2& c, float size, ImU32 color) {
+    draw->AddCircleFilled(c + ImVec2(-size * 0.5f, -size * 0.2f), size * 0.55f, color);
+    draw->AddCircleFilled(c + ImVec2(size * 0.5f, -size * 0.2f), size * 0.55f, color);
+    draw->AddTriangleFilled(c + ImVec2(-size * 1.03f, 0.0f), c + ImVec2(size * 1.03f, 0.0f), c + ImVec2(0.0f, size * 1.1f), color);
+}
+
+// The title in big outlined lettering with a pink shadow, a "SYSTEM STATUS"
+// ribbon, and a pill-shaped counter on the right holding a beating heart for
+// "LIVE", the date and the clock. Returns the buttons' rectangles.
+HeaderButtons drawOtakuHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    ImFont* display = state.displayFont;
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 3.0f;
+
+    const ImVec2 titleExtent = textSize(display, 24.0f, "VeeaStats");
+    const ImVec2 titlePos(box.min.x + 2.0f, std::floor(midY - titleExtent.y * 0.5f));
+    draw->AddText(display, 24.0f, titlePos + ImVec2(3.0f, 3.0f), withAlpha(kOtPink, 1.0f), "VeeaStats");
+    drawInkText(draw, display, 24.0f, titlePos, withAlpha(kOtWhite, 1.0f), "VeeaStats", 2.0f);
+    drawRibbon(draw, state.textFont, 11.0f, ImVec2(box.min.x + titleExtent.x + 18.0f, midY - 9.0f), 18.0f, kOtViolet, "SYSTEM STATUS");
+
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    std::string clock, date;
+    currentClock(clock, date);
+    const ImVec2 clockExtent = textSize(display, 14.0f, clock), dateExtent = textSize(state.textFont, 12.0f, date);
+    const float pillRight = buttons.storage.min.x - 12.0f;
+    const float pillLeft = pillRight - (clockExtent.x + dateExtent.x + 58.0f);
+    const Box pill{ImVec2(pillLeft, midY - 12.0f), ImVec2(pillRight, midY + 12.0f)};
+    draw->AddRectFilled(pill.min, pill.max, withAlpha(kOtNavy, 0.92f), 12.0f);
+    draw->AddRect(pill.min, pill.max, withAlpha(kOtTeal, 0.95f), 12.0f, 0, 2.0f);
+    const float beat = state.animate ? 1.0f + 0.15f * std::max(sinf(state.time * 6.0f), 0.0f) : 1.0f;
+    drawHeart(draw, ImVec2(pill.min.x + 16.0f, midY - 1.0f), 5.5f * beat, withAlpha(kOtPink, 1.0f));
+    draw->AddText(state.textFont, 12.0f, ImVec2(pill.min.x + 30.0f, midY - dateExtent.y * 0.5f), withAlpha(kOtLilac, 1.0f), date.c_str());
+    drawInkText(draw, display, 14.0f, ImVec2(pill.max.x - 12.0f - clockExtent.x, midY - clockExtent.y * 0.5f), withAlpha(kOtWhite, 1.0f), clock, 1.0f);
+    return buttons;
+}
+
+void applyOtakuStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(10.0f, 4.0f);
+    style.ItemSpacing = ImVec2(8.0f, 5.0f);
+    style.WindowRounding = style.PopupRounding = 12.0f;
+    style.ChildRounding = style.FrameRounding = style.ScrollbarRounding = style.GrabRounding = 8.0f;
+    style.WindowBorderSize = style.PopupBorderSize = 2.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 8.0f;
+
+    auto teal = [](float alpha) { return ImVec4(kOtTeal.x, kOtTeal.y, kOtTeal.z, alpha); };
+    auto violet = [](float alpha) { return ImVec4(kOtViolet.x, kOtViolet.y, kOtViolet.z, alpha); };
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = kOtWhite;
+    colors[ImGuiCol_TextDisabled]         = kOtLilac;
+    colors[ImGuiCol_WindowBg]             = ImVec4(kOtNavy.x, kOtNavy.y, kOtNavy.z, 0.98f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(kOtNavy.x, kOtNavy.y, kOtNavy.z, 0.98f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = teal(0.85f);
+    colors[ImGuiCol_FrameBg]              = violet(0.18f);
+    colors[ImGuiCol_FrameBgHovered]       = violet(0.32f);
+    colors[ImGuiCol_FrameBgActive]        = violet(0.45f);
+    colors[ImGuiCol_Button]               = violet(0.30f);
+    colors[ImGuiCol_ButtonHovered]        = violet(0.45f);
+    colors[ImGuiCol_ButtonActive]         = violet(0.60f);
+    colors[ImGuiCol_Header]               = ImVec4(kOtPink.x, kOtPink.y, kOtPink.z, 0.35f);
+    colors[ImGuiCol_HeaderHovered]        = ImVec4(kOtPink.x, kOtPink.y, kOtPink.z, 0.50f);
+    colors[ImGuiCol_HeaderActive]         = ImVec4(kOtPink.x, kOtPink.y, kOtPink.z, 0.65f);
+    colors[ImGuiCol_CheckMark]            = kOtPink;
+    colors[ImGuiCol_Separator]            = teal(0.30f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = teal(0.35f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = teal(0.50f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = teal(0.65f);
+    colors[ImGuiCol_TextSelectedBg]       = violet(0.40f);
+    colors[ImGuiCol_NavCursor]            = kOtPink;
+}
+
+// ---- Cyber-Punk -------------------------------------------------------------------
+// A neon city's heads-up display: thin red line work on near-black with
+// scanlines, panels with cut corners, hexagon gauges joined by circuit traces,
+// slanted segment bars, cyan readouts, and a yellow title that glitches now
+// and then.
+
+const ImVec4 kCpRed    (1.00f, 0.33f, 0.34f, 1.0f);    // line work, labels
+const ImVec4 kCpDimRed (0.55f, 0.15f, 0.17f, 1.0f);    // tracks, traces
+const ImVec4 kCpCyan   (0.37f, 0.96f, 1.00f, 1.0f);    // values; relaxed
+const ImVec4 kCpYellow (0.99f, 0.93f, 0.04f, 1.0f);    // title; busy
+const ImVec4 kCpHot    (1.00f, 0.16f, 0.45f, 1.0f);    // critical
+const ImVec4 kCpText   (0.95f, 0.88f, 0.86f, 1.0f);    // ordinary text
+const ImVec4 kCpPanel  (0.07f, 0.025f, 0.035f, 1.0f);  // panel fill
+const ImVec4 kCpBlack  (0.025f, 0.01f, 0.015f, 1.0f);  // background
+
+// Cyan when relaxed, yellow when busy, hot pink when critical.
+const ImVec4& cyberpunkLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kCpHot : (fraction > warnAt) ? kCpYellow : kCpCyan;
+}
+
+// The six corners of a box with its top-right and bottom-left corners cut off.
+std::array<ImVec2, 6> cutCorners(const Box& box, float cut) {
+    return {{box.min, ImVec2(box.max.x - cut, box.min.y), ImVec2(box.max.x, box.min.y + cut), box.max, ImVec2(box.min.x + cut, box.max.y),
+             ImVec2(box.min.x, box.max.y - cut)}};
+}
+
+// A row of slanted blocks lit up to `percent`, like a health bar.
+void drawSlantedSegments(ImDrawList* draw, const Box& box, float percent, const ImVec4& color) {
+    constexpr float kGap = 2.0f;
+    const float slant = box.height() * 0.5f;
+    const int count = std::clamp(static_cast<int>(box.width() / 7.0f), 6, 40);
+    const float step = (box.width() - slant) / static_cast<float>(count);
+    const float lit = std::clamp(percent, 0.0f, 100.0f) / 100.0f * static_cast<float>(count);
+    for (int i = 0; i < count; ++i) {
+        const float x = std::floor(box.min.x + step * static_cast<float>(i));
+        const float w = std::max(step - kGap, 1.0f);
+        const ImVec2 a(x + slant, box.min.y), b(x + slant + w, box.min.y), c(x + w, box.max.y), d(x, box.max.y);
+        const float amount = std::clamp(lit - static_cast<float>(i), 0.0f, 1.0f);
+        draw->AddQuadFilled(a, b, c, d, amount > 0.0f ? withAlpha(color, 0.35f + 0.65f * amount) : withAlpha(kCpDimRed, 0.45f));
+    }
+}
+
+// Near-black with a dot grid, scanlines, hatched corners and, while
+// animating, a short glitch every few seconds.
+void drawCyberpunkBackground(const ImVec2& size, const HudState& state) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    const ImU32 edge = withAlpha(kCpBlack, 1.0f), middle = withAlpha(ImVec4(0.08f, 0.02f, 0.03f, 1.0f), 1.0f);
+    draw->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), size, middle, edge, middle, edge);
+
+    constexpr float kDotStep = 24.0f;
+    for (float y = kDotStep; y < size.y; y += kDotStep) {
+        for (float x = kDotStep; x < size.x; x += kDotStep) draw->AddRectFilled(ImVec2(x, y), ImVec2(x + 1.0f, y + 1.0f), withAlpha(kCpRed, 0.16f));
+    }
+    for (float y = 0.0f; y < size.y; y += 3.0f) draw->AddLine(ImVec2(0.0f, y), ImVec2(size.x, y), IM_COL32(0, 0, 0, 40));
+
+    // Hazard hatching in the bottom-left and top-right corners.
+    for (int i = 0; i < 9; ++i) {
+        const float o = static_cast<float>(i) * 9.0f;
+        draw->AddLine(ImVec2(o, size.y), ImVec2(o + 60.0f, size.y - 60.0f), withAlpha(kCpRed, 0.10f), 3.0f);
+        draw->AddLine(ImVec2(size.x - o, 0.0f), ImVec2(size.x - o - 60.0f, 60.0f), withAlpha(kCpRed, 0.10f), 3.0f);
+    }
+
+    if (state.animate) {
+        constexpr float kEvery = 5.0f;
+        if (fmodf(state.time, kEvery) < 0.14f) {
+            const int glitch = static_cast<int>(state.time / kEvery);
+            for (int i = 0; i < 3; ++i) {
+                const float y = hash01(glitch * 13 + i) * size.y;
+                const float height = 2.0f + hash01(glitch * 17 + i) * 10.0f;
+                draw->AddRectFilled(ImVec2(0.0f, y), ImVec2(size.x, y + height), withAlpha(i == 1 ? kCpCyan : kCpRed, 0.10f));
+            }
+        }
+    }
+}
+
+// A dark panel with cut corners and a red outline; the title in red after a
+// small square, a rule running off to the right ending in a short code, and
+// a bright red tick along the top of the left edge. Returns the area for content.
+Box drawCyberpunkPanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    constexpr float kCut = 14.0f, kHeader = 24.0f;
+    const std::array<ImVec2, 6> outline = cutCorners(box, kCut);
+    draw->AddConvexPolyFilled(outline.data(), static_cast<int>(outline.size()), withAlpha(kCpPanel, 0.88f));
+    draw->AddPolyline(outline.data(), static_cast<int>(outline.size()), withAlpha(kCpRed, 0.55f), ImDrawFlags_Closed, 1.0f);
+    draw->AddRectFilled(ImVec2(box.min.x - 1.0f, box.min.y + 4.0f), ImVec2(box.min.x + 2.0f, box.min.y + 34.0f), withAlpha(kCpRed, 1.0f));
+    draw->AddLine(outline[4] + ImVec2(-1, 0), outline[5] + ImVec2(-1, 0), withAlpha(kCpRed, 1.0f), 2.0f);   // the cut, bright
+
+    constexpr float kTitleSize = 11.0f;
+    const ImVec2 titleExtent = textSize(state.displayFont, kTitleSize, title);
+    const float midY = std::floor(box.min.y + kHeader * 0.5f + 1.0f);
+    draw->AddRectFilled(ImVec2(box.min.x + 12.0f, midY - 3.0f), ImVec2(box.min.x + 18.0f, midY + 3.0f), withAlpha(kCpRed, 1.0f));
+    draw->AddText(state.displayFont, kTitleSize, ImVec2(box.min.x + 24.0f, std::floor(midY - titleExtent.y * 0.5f)), withAlpha(kCpRed, 1.0f),
+                  title.c_str());
+    const std::string code = format("%04X", static_cast<unsigned>(hash01(static_cast<int>(title.size()) * 97 + title[0]) * 65535.0f));
+    const ImVec2 codeExtent = textSize(state.textFont, 12.0f, code);
+    const float codeX = box.max.x - kCut - 10.0f - codeExtent.x;
+    draw->AddText(state.textFont, 12.0f, ImVec2(codeX, std::floor(midY - codeExtent.y * 0.5f)), withAlpha(kCpDimRed, 1.0f), code.c_str());
+    draw->AddLine(ImVec2(box.min.x + 32.0f + titleExtent.x, midY + 0.5f), ImVec2(codeX - 8.0f, midY + 0.5f), withAlpha(kCpRed, 0.30f));
+    return Box{ImVec2(box.min.x + 14.0f, box.min.y + kHeader + 6.0f), ImVec2(box.max.x - 12.0f, box.max.y - 10.0f)};
+}
+
+// "LABEL   value": the label small and red, the value in pale text.
+void drawCyberpunkInfoRow(const HudState& state, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::PushFont(state.displayFont, 10.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);   // line the small label up with the taller value
+    ImGui::TextColored(kCpRed, "%s", label);
+    ImGui::PopFont();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// The corners of a pointy-topped hexagon, clockwise from the top.
+std::array<ImVec2, 6> hexagon(const ImVec2& center, float radius) {
+    std::array<ImVec2, 6> points;
+    for (int i = 0; i < 6; ++i) points[static_cast<size_t>(i)] = pointOnCircle(center, radius, -kPi * 0.5f + kPi / 3.0f * static_cast<float>(i));
+    return points;
+}
+
+// A hexagon gauge: its outline lights up clockwise from the top to the value,
+// round a dark inner hexagon holding the label and number. The readouts sit
+// underneath.
+void drawCyberpunkGauge(ImDrawList* draw, const ImVec2& center, float radius, const GaugeReading& reading, const HudState& state) {
+    const float percent = std::clamp(reading.percent, 0.0f, 100.0f);
+    const float fraction = reading.hasValue ? percent / 100.0f : 0.0f;
+    const ImVec4& color = cyberpunkLoadColor(percent, reading.warnAt, reading.critAt);
+
+    const std::array<ImVec2, 6> outer = hexagon(center, radius), inner = hexagon(center, radius * 0.80f);
+    draw->AddConvexPolyFilled(inner.data(), 6, withAlpha(kCpPanel, 0.95f));
+    draw->AddPolyline(inner.data(), 6, withAlpha(kCpRed, 0.40f), ImDrawFlags_Closed, 1.0f);
+    draw->AddPolyline(outer.data(), 6, withAlpha(kCpDimRed, 0.70f), ImDrawFlags_Closed, 4.0f);
+
+    // The lit part of the outline: whole sides, then part of the next one.
+    const float sides = fraction * 6.0f;
+    std::vector<ImVec2> lit = {outer[0]};
+    for (int i = 0; i < 6 && static_cast<float>(i) < sides; ++i) {
+        const ImVec2& from = outer[static_cast<size_t>(i)];
+        const ImVec2& to = outer[static_cast<size_t>((i + 1) % 6)];
+        lit.push_back(from + (to - from) * std::min(sides - static_cast<float>(i), 1.0f));
+    }
+    if (lit.size() > 1) {
+        for (const auto& pass : kGlowPasses) {
+            draw->AddPolyline(lit.data(), static_cast<int>(lit.size()), withAlpha(color, pass[1]), ImDrawFlags_None, 4.0f + pass[0]);
+        }
+        draw->AddPolyline(lit.data(), static_cast<int>(lit.size()), withAlpha(color, 1.0f), ImDrawFlags_None, 4.0f);
+    }
+    for (const ImVec2& corner : outer) {   // a small notch at each corner
+        draw->AddRectFilled(corner - ImVec2(2, 2), corner + ImVec2(2, 2), withAlpha(kCpRed, 0.9f));
+    }
+
+    drawCenteredText(draw, state.displayFont, std::max(std::round(radius * 0.13f), 9.0f), ImVec2(center.x, center.y - radius * 0.36f),
+                     withAlpha(kCpRed, 1.0f), reading.label);
+    const float numberSize = std::round(radius * 0.42f);
+    if (reading.hasValue) {
+        const std::string number = format("%.0f", percent);
+        const float signSize = std::round(numberSize * 0.45f);
+        const ImVec2 numberExtent = textSize(state.displayFont, numberSize, number);
+        const ImVec2 signExtent = textSize(state.displayFont, signSize, "%");
+        const ImVec2 pos(std::floor(center.x - (numberExtent.x + signExtent.x + 2.0f) * 0.5f), std::floor(center.y - numberExtent.y * 0.38f));
+        draw->AddText(state.displayFont, numberSize, pos, withAlpha(color, 1.0f), number.c_str());
+        draw->AddText(state.displayFont, signSize, ImVec2(pos.x + numberExtent.x + 2.0f, pos.y + numberExtent.y - signExtent.y - 3.0f),
+                      withAlpha(kCpRed, 1.0f), "%");
+    } else {
+        drawCenteredText(draw, state.displayFont, std::round(numberSize * 0.6f), ImVec2(center.x, center.y + numberSize * 0.1f),
+                         withAlpha(kCpDimRed, 1.0f), "N/A");
+    }
+
+    drawCenteredText(draw, state.textFont, 16.0f, ImVec2(center.x, center.y + radius + 14.0f), withAlpha(kCpText, 1.0f), reading.line1);
+    drawCenteredText(draw, state.textFont, 14.0f, ImVec2(center.x, center.y + radius + 31.0f), withAlpha(kCpRed, 0.85f), reading.line2);
+}
+
+void drawCyberpunkGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    const float columnWidth = box.width() / 4.0f;
+    const float radius = std::floor(std::min(columnWidth * 0.36f, (box.height() - 46.0f) * 0.5f));
+    const float centerY = std::floor(box.min.y + radius + 4.0f);
+    const float halfWidth = radius * 0.866f;   // a pointy-topped hexagon's half width
+    for (int i = 0; i < 4; ++i) {
+        const float centerX = std::floor(box.min.x + columnWidth * (static_cast<float>(i) + 0.5f));
+        if (i < 3) {   // a circuit trace to the next gauge, with a little chip half way
+            const float from = centerX + halfWidth + 4.0f, to = centerX + columnWidth - halfWidth - 4.0f;
+            const float y = centerY + 0.5f;
+            draw->AddLine(ImVec2(from, y), ImVec2(to, y), withAlpha(kCpDimRed, 0.9f), 1.0f);
+            draw->AddLine(ImVec2(from + 10.0f, y + 8.0f), ImVec2(to - 10.0f, y + 8.0f), withAlpha(kCpDimRed, 0.5f), 1.0f);
+            const float mid = std::floor((from + to) * 0.5f);
+            draw->AddRect(ImVec2(mid - 5.0f, y - 4.0f), ImVec2(mid + 5.0f, y + 4.0f), withAlpha(kCpRed, 0.8f));
+        }
+        drawCyberpunkGauge(draw, ImVec2(centerX, centerY), radius, readings[i], state);
+    }
+}
+
+// The cores as rows of slanted segment bars, in as many columns as it takes.
+void drawCyberpunkCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawCyberpunkPanelFrame(draw, box, format("CORE STATUS // %zu THREADS", state.cores.size()), state), "##CyberpunkCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    constexpr float kRowHeight = 18.0f, kColumnGap = 18.0f;
+    const int count = static_cast<int>(state.cores.size());
+    const int rowsThatFit = std::max(static_cast<int>(room.y / kRowHeight), 1);
+    const int columns = std::max((count + rowsThatFit - 1) / rowsThatFit, 1);
+    const int rows = (count + columns - 1) / columns;
+    const float columnWidth = (room.x - kColumnGap * static_cast<float>(columns - 1)) / static_cast<float>(columns);
+    for (int i = 0; i < count; ++i) {
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const float x = std::floor(start.x + static_cast<float>(i / rows) * (columnWidth + kColumnGap));
+        const float midY = std::floor(start.y + (static_cast<float>(i % rows) + 0.5f) * kRowHeight);
+        const std::string label = format("C%02d", i);
+        const ImVec2 labelExtent = textSize(state.displayFont, 9.0f, label);
+        panel->AddText(state.displayFont, 9.0f, ImVec2(x, midY - labelExtent.y * 0.5f), withAlpha(kCpRed, 1.0f), label.c_str());
+        const ImVec4& color = cyberpunkLoadColor(value, 0.50f, 0.80f);
+        drawSlantedSegments(panel, Box{ImVec2(x + 28.0f, midY - 4.0f), ImVec2(x + columnWidth - 36.0f, midY + 4.0f)}, value, color);
+        const std::string text = format("%.0f%%", value);
+        const ImVec2 extent = textSize(state.textFont, 15.0f, text);
+        panel->AddText(state.textFont, 15.0f, ImVec2(x + columnWidth - extent.x, midY - extent.y * 0.5f), withAlpha(value / 100.0f > 0.5f ? color : kCpText, 1.0f),
+                       text.c_str());
+    }
+    ImGui::Dummy(room);
+    ImGui::EndChild();
+}
+
+// The title in yellow over red and cyan echoes that jump apart when it
+// glitches, "// NEURAL LINK DIAGNOSTICS", a blinking "REC" light, the clock in
+// cyan, and a red rule with a notch underneath. Returns the buttons' rectangles.
+HeaderButtons drawCyberpunkHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    ImFont* display = state.displayFont;
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 4.0f;
+
+    const bool glitching = state.animate && fmodf(state.time, 4.0f) < 0.12f;
+    const float split = glitching ? 4.0f : 1.5f;
+    const ImVec2 titleExtent = textSize(display, 22.0f, "VEEASTATS");
+    const ImVec2 titlePos(box.min.x, std::floor(midY - titleExtent.y * 0.5f));
+    draw->AddText(display, 22.0f, titlePos + ImVec2(-split, glitching ? 1.0f : 0.0f), withAlpha(kCpRed, 0.75f), "VEEASTATS");
+    draw->AddText(display, 22.0f, titlePos + ImVec2(split, glitching ? -1.0f : 0.0f), withAlpha(kCpCyan, 0.55f), "VEEASTATS");
+    draw->AddText(display, 22.0f, titlePos, withAlpha(kCpYellow, 1.0f), "VEEASTATS");
+    const ImVec2 subtitleExtent = textSize(display, 10.0f, "// NEURAL LINK DIAGNOSTICS");
+    draw->AddText(display, 10.0f, ImVec2(box.min.x + titleExtent.x + 16.0f, midY - subtitleExtent.y * 0.5f + 2.0f), withAlpha(kCpRed, 1.0f),
+                  "// NEURAL LINK DIAGNOSTICS");
+
+    const HeaderButtons buttons = drawHeaderButtons(ui, box.max.x, midY);
+    float right = buttons.storage.min.x - 18.0f;
+
+    std::string clock, date;
+    currentClock(clock, date);
+    const ImVec2 clockExtent = textSize(display, 16.0f, clock);
+    right -= clockExtent.x;
+    draw->AddText(display, 16.0f, ImVec2(right, midY - clockExtent.y * 0.5f), withAlpha(kCpCyan, 1.0f), clock.c_str());
+    const ImVec2 dateExtent = textSize(state.textFont, 14.0f, date);
+    right -= dateExtent.x + 12.0f;
+    draw->AddText(state.textFont, 14.0f, ImVec2(right, midY - dateExtent.y * 0.5f), withAlpha(kCpRed, 0.9f), date.c_str());
+
+    const bool lightOn = !state.animate || fmodf(state.time, 1.0f) < 0.6f;
+    const ImVec2 recExtent = textSize(display, 9.0f, "REC");
+    right -= recExtent.x + 22.0f;
+    if (lightOn) draw->AddCircleFilled(ImVec2(right - 6.0f, midY), 3.5f, withAlpha(kCpHot, 1.0f));
+    draw->AddCircle(ImVec2(right - 6.0f, midY), 5.5f, withAlpha(kCpHot, 0.6f));
+    draw->AddText(display, 9.0f, ImVec2(right + 3.0f, midY - recExtent.y * 0.5f), withAlpha(kCpHot, 1.0f), "REC");
+
+    // The rule: red, stepping down a few pixels a third of the way along.
+    const float ruleY = std::floor(box.max.y) - 4.5f;
+    const float step = box.min.x + std::floor(box.width() * 0.33f);
+    const ImVec2 rule[] = {ImVec2(box.min.x, ruleY - 3.0f), ImVec2(step, ruleY - 3.0f), ImVec2(step + 3.0f, ruleY), ImVec2(box.max.x, ruleY)};
+    draw->AddPolyline(rule, 4, withAlpha(kCpRed, 0.8f), ImDrawFlags_None, 1.0f);
+    draw->AddRectFilled(ImVec2(box.min.x, ruleY - 5.0f), ImVec2(box.min.x + 60.0f, ruleY - 3.0f), withAlpha(kCpYellow, 1.0f));
+    for (int i = 0; i < 5; ++i) {
+        const float x = box.max.x - 8.0f - static_cast<float>(i) * 6.0f;
+        draw->AddRectFilled(ImVec2(x - 3.0f, ruleY + 2.0f), ImVec2(x, ruleY + 5.0f), withAlpha(kCpRed, 0.7f));
+    }
+    return buttons;
+}
+
+void applyCyberpunkStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.WindowRounding = style.ChildRounding = style.FrameRounding = style.PopupRounding = 0.0f;
+    style.ScrollbarRounding = style.GrabRounding = 0.0f;
+    style.FrameBorderSize = 1.0f;
+    style.ScrollbarSize = 6.0f;
+
+    auto red = [](float alpha) { return ImVec4(kCpRed.x, kCpRed.y, kCpRed.z, alpha); };
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = kCpText;
+    colors[ImGuiCol_TextDisabled]         = ImVec4(kCpRed.x, kCpRed.y, kCpRed.z, 0.80f);
+    colors[ImGuiCol_WindowBg]             = ImVec4(0.05f, 0.015f, 0.025f, 0.97f);
+    colors[ImGuiCol_PopupBg]              = ImVec4(0.05f, 0.015f, 0.025f, 0.97f);
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = red(0.60f);
+    colors[ImGuiCol_FrameBg]              = red(0.08f);
+    colors[ImGuiCol_FrameBgHovered]       = red(0.20f);
+    colors[ImGuiCol_FrameBgActive]        = red(0.30f);
+    colors[ImGuiCol_Button]               = red(0.14f);
+    colors[ImGuiCol_ButtonHovered]        = red(0.28f);
+    colors[ImGuiCol_ButtonActive]         = red(0.40f);
+    colors[ImGuiCol_Header]               = red(0.22f);
+    colors[ImGuiCol_HeaderHovered]        = red(0.32f);
+    colors[ImGuiCol_HeaderActive]         = red(0.42f);
+    colors[ImGuiCol_CheckMark]            = kCpCyan;
+    colors[ImGuiCol_Separator]            = red(0.30f);
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = red(0.35f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = red(0.50f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = red(0.65f);
+    colors[ImGuiCol_TextSelectedBg]       = red(0.30f);
+    colors[ImGuiCol_NavCursor]            = kCpCyan;
+}
+
+// ---- Classroom (GNOME style) ----------------------------------------------------
+// GNOME's own look (libadwaita): a plain window under a header bar, content on
+// rounded cards in titled groups, thin progress rings and bars, and Inter (the
+// typeface GNOME's Adwaita Sans is built on). Like a real GNOME app it follows
+// the desktop: light or dark, in the user's accent colour. Section 8 reads
+// those from the desktop and calls setGnomeAppearance().
+
+// The colours of the current style.
+struct GnomeColors {
+    ImVec4 window, headerbar, card, popover;
+    ImVec4 text, dim;      // ordinary and secondary text
+    ImVec4 shade;          // borders, separators and empty tracks
+    ImVec4 accent;         // fills
+    bool dark{false};
+};
+GnomeColors g_gnome;
+
+const ImVec4 kGnomeBlue  (0.208f, 0.518f, 0.894f, 1.0f);   // #3584e4, GNOME's default accent
+const ImVec4 kGnomeYellow(0.898f, 0.647f, 0.039f, 1.0f);   // #e5a50a, "warning": busy
+const ImVec4 kGnomeRed   (0.878f, 0.106f, 0.141f, 1.0f);   // #e01b24, "error": critical
+
+ImVec4 rgbColor(unsigned rgb, float alpha = 1.0f) {
+    return ImVec4(static_cast<float>((rgb >> 16) & 0xff) / 255.0f, static_cast<float>((rgb >> 8) & 0xff) / 255.0f,
+                  static_cast<float>(rgb & 0xff) / 255.0f, alpha);
+}
+
+// Switches between libadwaita's light and dark colours, in the given accent.
+void setGnomeAppearance(bool dark, const ImVec4& accent) {
+    GnomeColors& c = g_gnome;
+    c.dark = dark;
+    c.accent = accent;
+    if (dark) {
+        c.window = rgbColor(0x222226);
+        c.headerbar = rgbColor(0x2e2e32);
+        c.card = rgbColor(0x36363a);
+        c.popover = rgbColor(0x36363a);
+        c.text = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        c.dim = ImVec4(1.0f, 1.0f, 1.0f, 0.55f);
+        c.shade = ImVec4(1.0f, 1.0f, 1.0f, 0.10f);
+    } else {
+        c.window = rgbColor(0xfafafb);
+        c.headerbar = rgbColor(0xffffff);
+        c.card = rgbColor(0xffffff);
+        c.popover = rgbColor(0xffffff);
+        c.text = ImVec4(0.0f, 0.0f, 0.024f, 0.80f);
+        c.dim = ImVec4(0.0f, 0.0f, 0.024f, 0.55f);
+        c.shade = ImVec4(0.0f, 0.0f, 0.024f, 0.10f);
+    }
+}
+
+// The accent colour when relaxed, yellow when busy, red when critical.
+ImVec4 gnomeLoadColor(float percent, float warnAt, float critAt) {
+    const float fraction = percent / 100.0f;
+    return (fraction > critAt) ? kGnomeRed : (fraction > warnAt) ? kGnomeYellow : g_gnome.accent;
+}
+
+// "OPERATING SYSTEM" -> "Operating system", the way GNOME writes headings.
+// Acronyms such as "CPU" and anything with a digit stay as they are.
+std::string gnomeCase(const std::string& text) {
+    static const char* const kKeep[] = {"CPU", "GPU", "RAM", "VRAM", "VDDC", "OS", "GB", "N/A"};
+    std::string result, word;
+    const auto flush = [&] {
+        bool keep = word.size() == 1;
+        for (const char* acronym : kKeep) keep = keep || word == acronym;
+        for (const char c : word) keep = keep || std::isdigit(static_cast<unsigned char>(c));
+        if (word == "VCORE") word = "VCore";
+        else if (!keep) for (char& c : word) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        result += word;
+        word.clear();
+    };
+    for (const char c : text) {
+        if (c == ' ') {
+            flush();
+            result += ' ';
+        } else {
+            word += c;
+        }
+    }
+    flush();
+    if (!result.empty()) result[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(result[0])));
+    return result;
+}
+
+constexpr float kGnomeHeaderBar = 58.0f;   // the header bar's height: the window's top padding plus the header row
+
+// A rounded card, with a soft shadow in the light style and a hairline edge.
+void drawGnomeCard(ImDrawList* draw, const Box& box) {
+    constexpr float kRounding = 12.0f;
+    if (!g_gnome.dark) draw->AddRectFilled(box.min + ImVec2(0, 1), box.max + ImVec2(0, 2), withAlpha(ImVec4(0, 0, 0, 1), 0.06f), kRounding);
+    draw->AddRectFilled(box.min, box.max, withAlpha(g_gnome.card, 1.0f), kRounding);
+    draw->AddRect(box.min, box.max, withAlpha(g_gnome.shade, 1.0f), kRounding);
+}
+
+// A thin rounded bar, like GNOME's progress bars.
+void drawGnomeBar(ImDrawList* draw, const Box& box, float percent, const ImVec4& color) {
+    const float rounding = box.height() * 0.5f;
+    draw->AddRectFilled(box.min, box.max, withAlpha(g_gnome.shade, 1.0f), rounding);
+    const float fill = std::floor(box.width() * std::clamp(percent, 0.0f, 100.0f) / 100.0f);
+    if (fill >= 1.0f) draw->AddRectFilled(box.min, ImVec2(box.min.x + std::max(fill, box.height()), box.max.y), withAlpha(color, 1.0f), rounding);
+}
+
+// The window colour, with the header bar across the top and a hairline under it.
+void drawGnomeBackground(const ImVec2& size, const HudState&) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), size, withAlpha(g_gnome.window, 1.0f));
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(size.x, kGnomeHeaderBar), withAlpha(g_gnome.headerbar, 1.0f));
+    draw->AddLine(ImVec2(0.0f, kGnomeHeaderBar - 0.5f), ImVec2(size.x, kGnomeHeaderBar - 0.5f), withAlpha(g_gnome.shade, 1.0f));
+}
+
+// A group: its title in bold above a rounded card. Returns the area for content.
+Box drawGnomePanelFrame(ImDrawList* draw, const Box& box, const std::string& title, const HudState& state) {
+    constexpr float kTitleHeight = 24.0f;
+    draw->AddText(state.displayFont, 14.0f, ImVec2(box.min.x + 4.0f, box.min.y + 2.0f), withAlpha(g_gnome.text, 1.0f), gnomeCase(title).c_str());
+    const Box card{ImVec2(box.min.x, box.min.y + kTitleHeight), box.max};
+    drawGnomeCard(draw, card);
+    return Box{card.min + ImVec2(14.0f, 10.0f), card.max - ImVec2(12.0f, 8.0f)};
+}
+
+// "Label   value" in a card, with a hairline between rows (as in GNOME's lists).
+void drawGnomeInfoRow(const HudState&, const char* label, const std::string& value) {
+    ImGui::TableNextRow();
+    if (ImGui::TableGetRowIndex() > 0 && label[0] != '\0') {
+        const float y = std::floor(ImGui::GetCursorScreenPos().y) - 1.5f;
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(ImGui::GetWindowPos().x, y), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - 4.0f, y),
+                                            withAlpha(g_gnome.shade, 1.0f));
+    }
+    ImGui::TableNextColumn();
+    ImGui::TextColored(g_gnome.dim, "%s", gnomeCase(label).c_str());
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", value.c_str());
+}
+
+// One gauge as a card: a bold heading, a thin ring that fills clockwise from
+// the top with the percentage in the middle, and the readouts under it.
+void drawGnomeGaugeCard(ImDrawList* draw, const Box& box, const GaugeReading& reading, const HudState& state) {
+    drawGnomeCard(draw, box);
+    draw->AddText(state.displayFont, 15.0f, ImVec2(box.min.x + 16.0f, box.min.y + 12.0f), withAlpha(g_gnome.text, 1.0f), gnomeCase(reading.label).c_str());
+
+    constexpr float kThickness = 8.0f, kBelow = 60.0f;   // kBelow: room for the readouts, keeping them as far from the card's edge as the heading is
+    const float radius = std::floor(std::min(box.width() * 0.30f, (box.height() - 38.0f - kBelow) * 0.5f));
+    const ImVec2 center(std::floor((box.min.x + box.max.x) * 0.5f), std::floor(box.min.y + 38.0f + radius));
+    draw->AddCircle(center, radius, withAlpha(g_gnome.shade, 1.0f), 64, kThickness);
+    const float fraction = reading.hasValue ? std::clamp(reading.percent, 0.0f, 100.0f) / 100.0f : 0.0f;
+    if (fraction > 0.0f) {
+        const ImVec4 color = gnomeLoadColor(reading.percent, reading.warnAt, reading.critAt);
+        const float start = -kPi * 0.5f, end = start + 2.0f * kPi * fraction;
+        draw->PathArcTo(center, radius, start, end, 64);
+        draw->PathStroke(withAlpha(color, 1.0f), kThickness);
+        draw->AddCircleFilled(pointOnCircle(center, radius, start), kThickness * 0.5f, withAlpha(color, 1.0f));   // round ends
+        draw->AddCircleFilled(pointOnCircle(center, radius, end), kThickness * 0.5f, withAlpha(color, 1.0f));
+    }
+    const std::string number = reading.hasValue ? format("%.0f%%", std::clamp(reading.percent, 0.0f, 100.0f)) : "N/A";
+    drawCenteredText(draw, state.displayFont, std::round(radius * 0.42f), center, withAlpha(reading.hasValue ? g_gnome.text : g_gnome.dim, 1.0f), number);
+
+    drawCenteredText(draw, state.textFont, 15.0f, ImVec2(center.x, center.y + radius + 20.0f), withAlpha(g_gnome.text, 1.0f), reading.line1);
+    drawCenteredText(draw, state.textFont, 13.0f, ImVec2(center.x, center.y + radius + 38.0f), withAlpha(g_gnome.dim, 1.0f), gnomeCase(reading.line2));
+}
+
+void drawGnomeGauges(ImDrawList* draw, const Box& box, const HudState& state, const LiveStats& live) {
+    const std::array<GaugeReading, 4> readings = gaugeReadings(state, live);
+    constexpr float kGap = 12.0f;
+    const float width = std::floor((box.width() - kGap * 3.0f) / 4.0f);
+    for (int i = 0; i < 4; ++i) {
+        const float x = box.min.x + static_cast<float>(i) * (width + kGap);
+        drawGnomeGaugeCard(draw, Box{ImVec2(x, box.min.y), ImVec2(x + width, box.max.y)}, readings[i], state);
+    }
+}
+
+// The cores as rows of "CPU 0   ▬▬▬   34%", in as many columns as it takes.
+void drawGnomeCores(ImDrawList* draw, const Box& box, const HudState& state) {
+    beginHudPanel(drawGnomePanelFrame(draw, box, format("Processor \xC2\xB7 %zu threads", state.cores.size()), state), "##GnomeCores");
+    ImDrawList* panel = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+
+    constexpr float kRowHeight = 19.0f, kColumnGap = 20.0f;
+    const int count = static_cast<int>(state.cores.size());
+    const int rowsThatFit = std::max(static_cast<int>(room.y / kRowHeight), 1);
+    const int columns = std::max((count + rowsThatFit - 1) / rowsThatFit, 1);
+    const int rows = (count + columns - 1) / columns;
+    const float columnWidth = (room.x - kColumnGap * static_cast<float>(columns - 1)) / static_cast<float>(columns);
+    for (int i = 0; i < count; ++i) {
+        const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
+        const float x = std::floor(start.x + static_cast<float>(i / rows) * (columnWidth + kColumnGap));
+        const float midY = std::floor(start.y + (static_cast<float>(i % rows) + 0.5f) * kRowHeight);
+        const std::string label = format("CPU %d", i);
+        const ImVec2 labelExtent = textSize(state.textFont, 13.0f, label);
+        panel->AddText(state.textFont, 13.0f, ImVec2(x, midY - labelExtent.y * 0.5f), withAlpha(g_gnome.dim, 1.0f), label.c_str());
+        drawGnomeBar(panel, Box{ImVec2(x + 50.0f, midY - 3.0f), ImVec2(x + columnWidth - 40.0f, midY + 3.0f)}, value, gnomeLoadColor(value, 0.50f, 0.80f));
+        const std::string text = format("%.0f%%", value);
+        const ImVec2 extent = textSize(state.textFont, 13.0f, text);
+        panel->AddText(state.textFont, 13.0f, ImVec2(x + columnWidth - extent.x, midY - extent.y * 0.5f), withAlpha(g_gnome.text, 1.0f), text.c_str());
+    }
+    ImGui::Dummy(room);
+    ImGui::EndChild();
+}
+
+// Like a GNOME header bar: the title and a dim subtitle in the middle, a live
+// light with the date and time on the left, the buttons on the right.
+HeaderButtons drawGnomeHeader(ImDrawList* draw, const Box& box, UiState& ui, const HudState& state) {
+    const float midY = std::floor((box.min.y + box.max.y) * 0.5f) - 3.0f;
+    const float centerX = std::floor((box.min.x + box.max.x) * 0.5f);
+    drawCenteredText(draw, state.displayFont, 15.0f, ImVec2(centerX, midY - 7.0f), withAlpha(g_gnome.text, 1.0f), "VeeaStats");
+    drawCenteredText(draw, state.textFont, 12.0f, ImVec2(centerX, midY + 9.0f), withAlpha(g_gnome.dim, 1.0f), "System Monitor");
+
+    const float pulse = state.animate ? 0.55f + 0.45f * sinf(state.time * 2.5f) : 1.0f;
+    draw->AddCircleFilled(ImVec2(box.min.x + 8.0f, midY), 4.5f, withAlpha(g_gnome.accent, pulse));
+    char when[48] = "";
+    const time_t now = time(nullptr);
+    tm local{};
+    localtime_r(&now, &local);
+    strftime(when, sizeof(when), "%a %e %b  %H:%M", &local);
+    const ImVec2 extent = textSize(state.textFont, 14.0f, when);
+    draw->AddText(state.textFont, 14.0f, ImVec2(box.min.x + 20.0f, midY - extent.y * 0.5f), withAlpha(g_gnome.text, 1.0f), when);
+
+    return drawHeaderButtons(ui, box.max.x, midY);
+}
+
+void applyGnomeStyle(ImGuiStyle& style) {
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(10.0f, 5.0f);
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
+    style.WindowRounding = style.PopupRounding = 12.0f;
+    style.FrameRounding = style.GrabRounding = style.ScrollbarRounding = 6.0f;
+    style.ChildRounding = 0.0f;
+    style.FrameBorderSize = 0.0f;
+    style.ScrollbarSize = 8.0f;
+
+    const GnomeColors& c = g_gnome;
+    const auto tint = [&](float alpha) { return c.dark ? ImVec4(1.0f, 1.0f, 1.0f, alpha) : ImVec4(0.0f, 0.0f, 0.024f, alpha); };
+    const auto accent = [&](float alpha) { return ImVec4(c.accent.x, c.accent.y, c.accent.z, alpha); };
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text]                 = c.text;
+    colors[ImGuiCol_TextDisabled]         = c.dim;
+    colors[ImGuiCol_WindowBg]             = c.popover;
+    colors[ImGuiCol_PopupBg]              = c.popover;
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_Border]               = tint(0.15f);
+    colors[ImGuiCol_FrameBg]              = tint(0.08f);
+    colors[ImGuiCol_FrameBgHovered]       = tint(0.12f);
+    colors[ImGuiCol_FrameBgActive]        = tint(0.18f);
+    colors[ImGuiCol_Button]               = tint(0.08f);
+    colors[ImGuiCol_ButtonHovered]        = tint(0.12f);
+    colors[ImGuiCol_ButtonActive]         = tint(0.18f);
+    colors[ImGuiCol_Header]               = accent(0.22f);
+    colors[ImGuiCol_HeaderHovered]        = tint(0.08f);
+    colors[ImGuiCol_HeaderActive]         = accent(0.30f);
+    colors[ImGuiCol_CheckMark]            = c.accent;
+    colors[ImGuiCol_Separator]            = c.shade;
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_ScrollbarGrab]        = tint(0.20f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = tint(0.30f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = tint(0.40f);
+    colors[ImGuiCol_TextSelectedBg]       = accent(0.30f);
+    colors[ImGuiCol_NavCursor]            = c.accent;
+}
+
 // ============================================================================
 // 7. SKIN SWITCHING
 // ============================================================================
@@ -3920,6 +5381,14 @@ struct UiFonts {
     ImFont* gunshipDisplay{nullptr};    // Press Start 2P: also crisp at multiples of 8 px
     ImFont* halloweenText{nullptr};     // Fredoka SemiBold
     ImFont* halloweenDisplay{nullptr};  // Henny Penny
+    ImFont* poseidonText{nullptr};      // Marcellus
+    ImFont* poseidonDisplay{nullptr};   // Cinzel Bold
+    ImFont* otakuText{nullptr};         // M PLUS Rounded 1c ExtraBold
+    ImFont* otakuDisplay{nullptr};      // Dela Gothic One
+    ImFont* cyberpunkText{nullptr};     // Rajdhani (the same font as JARV's text)
+    ImFont* cyberpunkDisplay{nullptr};  // Chakra Petch Bold
+    ImFont* gnomeText{nullptr};         // Inter
+    ImFont* gnomeDisplay{nullptr};      // Inter Bold
 };
 
 UiFonts loadFonts() {
@@ -3940,18 +5409,31 @@ UiFonts loadFonts() {
 
     fonts.halloweenText    = atlas->AddFontFromMemoryCompressedBase85TTF(FredokaSemiBold_compressed_data_base85, 16.0f);
     fonts.halloweenDisplay = atlas->AddFontFromMemoryCompressedBase85TTF(HennyPennyRegular_compressed_data_base85, 18.0f);
+
+    fonts.poseidonText     = atlas->AddFontFromMemoryCompressedBase85TTF(MarcellusRegular_compressed_data_base85, 16.0f);
+    fonts.poseidonDisplay  = atlas->AddFontFromMemoryCompressedBase85TTF(CinzelBold_compressed_data_base85, 14.0f);
+    fonts.otakuText        = atlas->AddFontFromMemoryCompressedBase85TTF(MPlusRounded1cExtraBold_compressed_data_base85, 15.0f);
+    fonts.otakuDisplay     = atlas->AddFontFromMemoryCompressedBase85TTF(DelaGothicOneRegular_compressed_data_base85, 16.0f);
+    fonts.cyberpunkText    = fonts.jarvText;
+    fonts.cyberpunkDisplay = atlas->AddFontFromMemoryCompressedBase85TTF(ChakraPetchBold_compressed_data_base85, 14.0f);
+    fonts.gnomeText        = atlas->AddFontFromMemoryCompressedBase85TTF(InterRegular_compressed_data_base85, 15.0f);
+    fonts.gnomeDisplay     = atlas->AddFontFromMemoryCompressedBase85TTF(InterBold_compressed_data_base85, 15.0f);
     return fonts;
 }
 
 // Every HUD skin, ready to draw (see section 6).
 struct HudSkins {
-    HudSkin jarv, galactic, gunship, halloween;
+    HudSkin jarv, galactic, gunship, halloween, poseidon, otaku, cyberpunk, gnome;
 
     const HudSkin& forSkin(Skin skin) const {
         switch (skin) {
             case Skin::Galactic:  return galactic;
             case Skin::Gunship:   return gunship;
             case Skin::Halloween: return halloween;
+            case Skin::Poseidon:  return poseidon;
+            case Skin::Otaku:     return otaku;
+            case Skin::Cyberpunk: return cyberpunk;
+            case Skin::Gnome:     return gnome;
             default:              return jarv;
         }
     }
@@ -3968,6 +5450,14 @@ HudSkins makeHudSkins(const UiFonts& fonts) {
     skins.halloween = {fonts.halloweenText, fonts.halloweenDisplay, 13.0f, {}, drawHalloweenBackground, drawHalloweenHeader,
                        drawHalloweenGauges, drawHalloweenPanelFrame, drawHalloweenCores, drawHalloweenInfoRow, applyHalloweenStyle,
                        fonts.halloweenText};
+    skins.poseidon = {fonts.poseidonText, fonts.poseidonDisplay, 10.0f, {}, drawPoseidonBackground, drawPoseidonHeader,
+                      drawPoseidonGauges, drawPoseidonPanelFrame, drawPoseidonCores, drawPoseidonInfoRow, applyPoseidonStyle};
+    skins.otaku = {fonts.otakuText, fonts.otakuDisplay, 12.0f, {}, drawOtakuBackground, drawOtakuHeader,
+                   drawOtakuGauges, drawOtakuPanelFrame, drawOtakuCores, drawOtakuInfoRow, applyOtakuStyle, fonts.otakuText};
+    skins.cyberpunk = {fonts.cyberpunkText, fonts.cyberpunkDisplay, 10.0f, {}, drawCyberpunkBackground, drawCyberpunkHeader,
+                       drawCyberpunkGauges, drawCyberpunkPanelFrame, drawCyberpunkCores, drawCyberpunkInfoRow, applyCyberpunkStyle};
+    skins.gnome = {fonts.gnomeText, fonts.gnomeDisplay, 14.0f, {}, drawGnomeBackground, drawGnomeHeader,
+                   drawGnomeGauges, drawGnomePanelFrame, drawGnomeCores, drawGnomeInfoRow, applyGnomeStyle, fonts.gnomeText};
     return skins;
 }
 
@@ -3984,6 +5474,10 @@ void applySkin(Skin skin, const UiFonts& fonts) {
         case Skin::Galactic: applyGalacticStyle(style); font = fonts.galacticText; break;
         case Skin::Gunship:  applyGunshipStyle(style);  font = fonts.gunshipText;  break;
         case Skin::Halloween: applyHalloweenStyle(style); font = fonts.halloweenText; break;
+        case Skin::Poseidon:  applyPoseidonStyle(style);  font = fonts.poseidonText;  break;
+        case Skin::Otaku:     applyOtakuStyle(style);     font = fonts.otakuText;     break;
+        case Skin::Cyberpunk: applyCyberpunkStyle(style); font = fonts.cyberpunkText; break;
+        case Skin::Gnome:     applyGnomeStyle(style);     font = fonts.gnomeText;     break;
     }
     ImGui::GetIO().FontDefault = font;
 }
@@ -4065,6 +5559,7 @@ constexpr unsigned kRequestQuit           = 1u << 1;
 constexpr unsigned kRequestToggleOverlay  = 1u << 2;
 constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it appeared or disappeared; see g_overlayActive
 constexpr unsigned kRequestStaticInfo     = 1u << 4;   // the hardware details are ready (see main)
+constexpr unsigned kRequestAppearance     = 1u << 5;   // the desktop's light/dark style or accent colour changed
 std::atomic<unsigned> g_requests{0};
 
 // True while the overlay is on screen (not while it waits, hidden, for its app
@@ -4124,23 +5619,26 @@ int ignoreX11Error(Display*, XErrorEvent*) {
 }
 
 // The numbers the overlay shows, sent over by the main process as one line:
-// "stats <cpu %> <cpu V> <ram %> <ram used GB> <ram total GB> <gpu has load> <gpu %> <gpu V>".
+// "stats <cpu %> <cpu V> <cpu °C> <ram %> <ram used GB> <ram total GB> <gpu has load> <gpu %> <gpu V> <gpu °C> <in °F>".
 struct OverlayNumbers {
-    float cpuPercent{0.0f}, cpuVolts{0.0f};
+    float cpuPercent{0.0f}, cpuVolts{0.0f}, cpuCelsius{0.0f};
     float ramPercent{0.0f}, ramUsedGb{0.0f}, ramTotalGb{0.0f};
     int gpuHasLoad{0};
-    float gpuPercent{0.0f}, gpuVolts{0.0f};
+    float gpuPercent{0.0f}, gpuVolts{0.0f}, gpuCelsius{0.0f};
+    int fahrenheit{0};
 };
 
-std::string overlayStatsLine(const LiveStats& live) {
-    return format("stats %.1f %.3f %.1f %.2f %.2f %d %.1f %.3f\n", averageCpuPercent(live), live.cpuVoltage, live.ram.percent,
-                  live.ram.usedGb, live.ram.totalGb, live.gpu.hasLoad ? 1 : 0, live.gpu.gpuUsage, live.gpu.voltageV);
+std::string overlayStatsLine(const LiveStats& live, bool fahrenheit) {
+    return format("stats %.1f %.3f %.1f %.1f %.2f %.2f %d %.1f %.3f %.1f %d\n", averageCpuPercent(live), live.cpuVoltage,
+                  live.cpuTemperatureC, live.ram.percent, live.ram.usedGb, live.ram.totalGb, live.gpu.hasLoad ? 1 : 0,
+                  live.gpu.gpuUsage, live.gpu.voltageV, live.gpu.temperatureC, fahrenheit ? 1 : 0);
 }
 
 bool parseOverlayStatsLine(const std::string& line, OverlayNumbers& numbers) {
     OverlayNumbers parsed;
-    if (sscanf(line.c_str(), "stats %f %f %f %f %f %d %f %f", &parsed.cpuPercent, &parsed.cpuVolts, &parsed.ramPercent,
-               &parsed.ramUsedGb, &parsed.ramTotalGb, &parsed.gpuHasLoad, &parsed.gpuPercent, &parsed.gpuVolts) != 8) {
+    if (sscanf(line.c_str(), "stats %f %f %f %f %f %f %d %f %f %f %d", &parsed.cpuPercent, &parsed.cpuVolts, &parsed.cpuCelsius,
+               &parsed.ramPercent, &parsed.ramUsedGb, &parsed.ramTotalGb, &parsed.gpuHasLoad, &parsed.gpuPercent, &parsed.gpuVolts,
+               &parsed.gpuCelsius, &parsed.fahrenheit) != 11) {
         return false;
     }
     numbers = parsed;
@@ -4253,7 +5751,7 @@ ImVec2 screenCorner(const X11Api& x11, Display* display) {
 // Each look returns the panel's size, and the window is fitted to it:
 //   CPU  34%  1.208 V
 //   RAM  41%  12.5 / 30.5 GB
-//   GPU  67%  0.812 V
+//   GPU  67%  58°C  0.812 V
 struct OverlayRow {
     const char* label;
     bool hasPercent;
@@ -4262,13 +5760,21 @@ struct OverlayRow {
     bool detailIsVoltage;   // shown in the voltage colour (Classic)
 };
 
+// "62°C  1.212 V": the temperature and voltage, whichever are known, or "N/A".
+std::string overlaySensorText(float celsius, float volts, bool fahrenheit) {
+    std::string text = celsius > 0.0f ? temperatureText(celsius, fahrenheit) : "";
+    if (volts > 0.0f) text += (text.empty() ? "" : "  ") + format("%.3f V", volts);
+    return text.empty() ? "N/A" : text;
+}
+
 std::vector<OverlayRow> overlayRows(const OverlayNumbers& numbers) {
+    const bool fahrenheit = numbers.fahrenheit != 0;
     return {
-        {"CPU", true, numbers.cpuPercent, 0.50f, 0.80f, numbers.cpuVolts > 0.0f ? format("%.3f V", numbers.cpuVolts) : "N/A", true},
+        {"CPU", true, numbers.cpuPercent, 0.50f, 0.80f, overlaySensorText(numbers.cpuCelsius, numbers.cpuVolts, fahrenheit), true},
         {"RAM", numbers.ramTotalGb > 0.0f, numbers.ramPercent, 0.65f, 0.85f,
          format("%.1f / %.1f GB", numbers.ramUsedGb, numbers.ramTotalGb), false},
         {"GPU", numbers.gpuHasLoad != 0, numbers.gpuPercent, 0.50f, 0.85f,
-         numbers.gpuVolts > 0.0f ? format("%.3f V", numbers.gpuVolts) : "N/A", true},
+         overlaySensorText(numbers.gpuCelsius, numbers.gpuVolts, fahrenheit), true},
     };
 }
 
@@ -4559,6 +6065,208 @@ ImVec2 drawClassicOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const
     return size;
 }
 
+// Poseidon: dark sea glass with a gold border and a Greek key band along the
+// top; a water-filled tube per row and the number in carved capitals.
+ImVec2 drawPoseidonOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kLabelSize = 11.0f, kValueSize = 18.0f, kDetailSize = 16.0f;
+    constexpr float kPaddingX = 12.0f, kPaddingTop = 19.0f, kPaddingBottom = 6.0f, kRowHeight = 24.0f, kColumnGap = 10.0f;
+    constexpr float kTubeWidth = 60.0f, kTubeHeight = 8.0f;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.poseidonDisplay, kLabelSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.poseidonText, kDetailSize, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.poseidonDisplay, kValueSize, "100%").x;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + labelWidth + kTubeWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingTop + kPaddingBottom + kRowHeight * static_cast<float>(rows.size())));
+
+    draw->AddRectFilled(ImVec2(0, 0), size, withAlpha(kPoPanel, 0.62f), 3.0f);
+    draw->AddRect(ImVec2(0.5f, 0.5f), size - ImVec2(0.5f, 0.5f), withAlpha(kPoGold, 0.80f), 3.0f);
+    drawGreekKey(draw, 6.0f, size.x - 6.0f, 4.0f, 8.0f, withAlpha(kPoGold, 0.55f));
+
+    const auto shadowedText = [&](ImFont* font, float fontSize, ImVec2 pos, ImU32 color, const std::string& text) {
+        draw->AddText(font, fontSize, pos + ImVec2(1.0f, 1.0f), IM_COL32(0, 0, 0, 160), text.c_str());
+        draw->AddText(font, fontSize, pos, color, text.c_str());
+    };
+
+    float rowTop = kPaddingTop;
+    for (const OverlayRow& row : rows) {
+        const float midY = rowTop + kRowHeight * 0.5f;
+        float x = kPaddingX;
+        const ImVec2 labelExtent = textSize(fonts.poseidonDisplay, kLabelSize, row.label);
+        shadowedText(fonts.poseidonDisplay, kLabelSize, ImVec2(x, std::floor(midY - labelExtent.y * 0.5f)), withAlpha(kPoGold, 1.0f), row.label);
+        x += labelWidth + kColumnGap;
+
+        const ImVec4& color = poseidonLoadColor(row.percent, row.warnAt, row.critAt);
+        const Box tube{ImVec2(x, std::floor(midY - kTubeHeight * 0.5f)), ImVec2(x + kTubeWidth, std::floor(midY + kTubeHeight * 0.5f))};
+        draw->AddRectFilled(tube.min, tube.max, withAlpha(kPoSea, 0.15f), 4.0f);
+        if (row.hasPercent && row.percent > 0.5f) {
+            draw->AddRectFilled(tube.min, ImVec2(tube.min.x + std::max(kTubeWidth * std::min(row.percent, 100.0f) / 100.0f, 8.0f), tube.max.y),
+                                withAlpha(color, 1.0f), 4.0f);
+        }
+        draw->AddRect(tube.min, tube.max, withAlpha(kPoGold, 0.55f), 4.0f);
+        x += kTubeWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const ImVec2 valueExtent = textSize(fonts.poseidonDisplay, kValueSize, value);
+        shadowedText(fonts.poseidonDisplay, kValueSize, ImVec2(x + valueWidth - valueExtent.x, std::floor(midY - valueExtent.y * 0.5f)),
+                     withAlpha(!row.hasPercent ? kPoFoam : (row.percent / 100.0f > row.warnAt) ? color : kPoMarble, 1.0f), value);
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.poseidonText, kDetailSize, row.detail);
+        shadowedText(fonts.poseidonText, kDetailSize, ImVec2(x, std::floor(midY - detailExtent.y * 0.5f)), withAlpha(kPoFoam, 1.0f), row.detail);
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
+// Otaku: a rounded navy card with a teal edge; violet name chips, candy pill
+// bars and big outlined numbers.
+ImVec2 drawOtakuOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kChipWidth = 38.0f, kValueSize = 17.0f, kDetailSize = 14.0f;
+    constexpr float kPaddingX = 12.0f, kPaddingY = 8.0f, kRowHeight = 25.0f, kColumnGap = 9.0f, kBarWidth = 58.0f;
+
+    float detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) detailWidth = std::max(detailWidth, textSize(fonts.otakuText, kDetailSize, row.detail).x);
+    const float valueWidth = textSize(fonts.otakuDisplay, kValueSize, "100%").x + 4.0f;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + kChipWidth + kBarWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size())));
+
+    draw->AddRectFilled(ImVec2(0, 0), size, withAlpha(kOtNavy, 0.72f), 12.0f);
+    draw->AddRect(ImVec2(1.0f, 1.0f), size - ImVec2(1.0f, 1.0f), withAlpha(kOtTeal, 0.90f), 12.0f, 0, 2.0f);
+    drawSparkle(draw, ImVec2(size.x - 10.0f, 9.0f), 4.0f, withAlpha(kOtLemon, 1.0f));
+
+    float rowTop = kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = std::floor(rowTop + kRowHeight * 0.5f);
+        float x = kPaddingX;
+        draw->AddRectFilled(ImVec2(x, midY - 8.0f), ImVec2(x + kChipWidth, midY + 8.0f), withAlpha(kOtViolet, 0.95f), 8.0f);
+        drawCenteredText(draw, fonts.otakuText, 12.0f, ImVec2(x + kChipWidth * 0.5f, midY), withAlpha(kOtWhite, 1.0f), row.label);
+        x += kChipWidth + kColumnGap;
+
+        drawPillBar(draw, Box{ImVec2(x, midY - 5.0f), ImVec2(x + kBarWidth, midY + 5.0f)}, row.hasPercent ? row.percent : 0.0f,
+                    otakuLoadColor(row.percent, row.warnAt, row.critAt));
+        x += kBarWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const ImVec2 valueExtent = textSize(fonts.otakuDisplay, kValueSize, value);
+        drawInkText(draw, fonts.otakuDisplay, kValueSize, ImVec2(x + valueWidth - valueExtent.x, std::floor(midY - valueExtent.y * 0.5f)),
+                    withAlpha(kOtWhite, 1.0f), value, 1.5f);
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.otakuText, kDetailSize, row.detail);
+        drawInkText(draw, fonts.otakuText, kDetailSize, ImVec2(x, std::floor(midY - detailExtent.y * 0.5f)), withAlpha(kOtLilac, 1.0f), row.detail, 1.0f);
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
+// Cyber-Punk: a near-black panel with cut corners and a red outline; slanted
+// segment bars and cyan numbers.
+ImVec2 drawCyberpunkOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kLabelSize = 11.0f, kValueSize = 18.0f, kDetailSize = 17.0f;
+    constexpr float kPaddingX = 14.0f, kPaddingY = 7.0f, kRowHeight = 24.0f, kColumnGap = 10.0f, kBarWidth = 70.0f;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.cyberpunkDisplay, kLabelSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.cyberpunkText, kDetailSize, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.cyberpunkDisplay, kValueSize, "100%").x;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + labelWidth + kBarWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size())));
+
+    const std::array<ImVec2, 6> outline = cutCorners(Box{ImVec2(0.5f, 0.5f), size - ImVec2(0.5f, 0.5f)}, 10.0f);
+    draw->AddConvexPolyFilled(outline.data(), 6, withAlpha(kCpPanel, 0.62f));
+    draw->AddPolyline(outline.data(), 6, withAlpha(kCpRed, 0.75f), ImDrawFlags_Closed, 1.0f);
+    draw->AddRectFilled(ImVec2(0.0f, 4.0f), ImVec2(3.0f, 26.0f), withAlpha(kCpRed, 1.0f));
+
+    const auto shadowedText = [&](ImFont* font, float fontSize, ImVec2 pos, ImU32 color, const std::string& text) {
+        draw->AddText(font, fontSize, pos + ImVec2(1.0f, 1.0f), IM_COL32(0, 0, 0, 170), text.c_str());
+        draw->AddText(font, fontSize, pos, color, text.c_str());
+    };
+
+    float rowTop = kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = std::floor(rowTop + kRowHeight * 0.5f);
+        float x = kPaddingX;
+        const ImVec2 labelExtent = textSize(fonts.cyberpunkDisplay, kLabelSize, row.label);
+        shadowedText(fonts.cyberpunkDisplay, kLabelSize, ImVec2(x, std::floor(midY - labelExtent.y * 0.5f)), withAlpha(kCpRed, 1.0f), row.label);
+        x += labelWidth + kColumnGap;
+
+        const ImVec4& color = cyberpunkLoadColor(row.percent, row.warnAt, row.critAt);
+        drawSlantedSegments(draw, Box{ImVec2(x, midY - 4.0f), ImVec2(x + kBarWidth, midY + 4.0f)}, row.hasPercent ? row.percent : 0.0f, color);
+        x += kBarWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const ImVec2 valueExtent = textSize(fonts.cyberpunkDisplay, kValueSize, value);
+        shadowedText(fonts.cyberpunkDisplay, kValueSize, ImVec2(x + valueWidth - valueExtent.x, std::floor(midY - valueExtent.y * 0.5f)),
+                     withAlpha(row.hasPercent ? color : kCpDimRed, 1.0f), value);
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.cyberpunkText, kDetailSize, row.detail);
+        shadowedText(fonts.cyberpunkText, kDetailSize, ImVec2(x, std::floor(midY - detailExtent.y * 0.5f)), withAlpha(kCpText, 1.0f), row.detail);
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
+// Classroom: like GNOME's own on-screen pop-ups (volume, brightness): a dark
+// see-through rounded panel, white text and thin level bars.
+ImVec2 drawGnomeOverlay(ImDrawList* draw, const OverlayNumbers& numbers, const UiFonts& fonts) {
+    const std::vector<OverlayRow> rows = overlayRows(numbers);
+    constexpr float kLabelSize = 14.0f, kValueSize = 16.0f, kDetailSize = 14.0f;
+    constexpr float kPaddingX = 16.0f, kPaddingY = 9.0f, kRowHeight = 24.0f, kColumnGap = 12.0f, kBarWidth = 72.0f;
+
+    float labelWidth = 0.0f, detailWidth = 0.0f;
+    for (const OverlayRow& row : rows) {
+        labelWidth = std::max(labelWidth, textSize(fonts.gnomeDisplay, kLabelSize, row.label).x);
+        detailWidth = std::max(detailWidth, textSize(fonts.gnomeText, kDetailSize, row.detail).x);
+    }
+    const float valueWidth = textSize(fonts.gnomeDisplay, kValueSize, "100%").x;
+    const ImVec2 size(std::ceil(kPaddingX * 2.0f + labelWidth + kBarWidth + valueWidth + detailWidth + kColumnGap * 3.0f),
+                      std::ceil(kPaddingY * 2.0f + kRowHeight * static_cast<float>(rows.size())));
+
+    const ImVec4 white(1.0f, 1.0f, 1.0f, 1.0f);
+    draw->AddRectFilled(ImVec2(0, 0), size, IM_COL32(28, 28, 32, 190), 14.0f);
+    draw->AddRect(ImVec2(0.5f, 0.5f), size - ImVec2(0.5f, 0.5f), IM_COL32(255, 255, 255, 30), 14.0f);
+
+    float rowTop = kPaddingY;
+    for (const OverlayRow& row : rows) {
+        const float midY = std::floor(rowTop + kRowHeight * 0.5f);
+        float x = kPaddingX;
+        const ImVec2 labelExtent = textSize(fonts.gnomeDisplay, kLabelSize, row.label);
+        draw->AddText(fonts.gnomeDisplay, kLabelSize, ImVec2(x, std::floor(midY - labelExtent.y * 0.5f)), withAlpha(white, 1.0f), row.label);
+        x += labelWidth + kColumnGap;
+
+        // Bars are white, as in GNOME's pop-ups, until the load gets high.
+        const float fraction = row.percent / 100.0f;
+        const ImVec4& barColor = !row.hasPercent ? white : fraction > row.critAt ? kGnomeRed : fraction > row.warnAt ? kGnomeYellow : white;
+        const Box bar{ImVec2(x, midY - 3.0f), ImVec2(x + kBarWidth, midY + 3.0f)};
+        draw->AddRectFilled(bar.min, bar.max, IM_COL32(255, 255, 255, 50), 3.0f);
+        if (row.hasPercent && row.percent > 0.5f) {
+            draw->AddRectFilled(bar.min, ImVec2(bar.min.x + std::max(kBarWidth * std::min(row.percent, 100.0f) / 100.0f, 6.0f), bar.max.y),
+                                withAlpha(barColor, 1.0f), 3.0f);
+        }
+        x += kBarWidth + kColumnGap;
+
+        const std::string value = row.hasPercent ? format("%.0f%%", row.percent) : "N/A";
+        const ImVec2 valueExtent = textSize(fonts.gnomeDisplay, kValueSize, value);
+        draw->AddText(fonts.gnomeDisplay, kValueSize, ImVec2(x + valueWidth - valueExtent.x, std::floor(midY - valueExtent.y * 0.5f)),
+                      withAlpha(white, 1.0f), value.c_str());
+        x += valueWidth + kColumnGap;
+
+        const ImVec2 detailExtent = textSize(fonts.gnomeText, kDetailSize, row.detail);
+        draw->AddText(fonts.gnomeText, kDetailSize, ImVec2(x, std::floor(midY - detailExtent.y * 0.5f)), withAlpha(white, 0.75f), row.detail.c_str());
+        rowTop += kRowHeight;
+    }
+    return size;
+}
+
 // `CpuMonitor --overlay`: the overlay window. Takes orders from the main process
 // on stdin ("stats ...", "skin <id>" (see kSkinChoices), "toggle app" / "toggle
 // screen"), reports hotkey presses ("hotkey") and whether it is on screen
@@ -4642,6 +6350,10 @@ int runOverlayProcess() {
             case Skin::Galactic:  panel = drawGalacticOverlay(draw, numbers, fonts);  break;
             case Skin::Gunship:   panel = drawGunshipOverlay(draw, numbers, fonts);   break;
             case Skin::Halloween: panel = drawHalloweenOverlay(draw, numbers, fonts); break;
+            case Skin::Poseidon:  panel = drawPoseidonOverlay(draw, numbers, fonts);  break;
+            case Skin::Otaku:     panel = drawOtakuOverlay(draw, numbers, fonts);     break;
+            case Skin::Cyberpunk: panel = drawCyberpunkOverlay(draw, numbers, fonts); break;
+            case Skin::Gnome:     panel = drawGnomeOverlay(draw, numbers, fonts);     break;
         }
         ImGui::Render();
 
@@ -4811,7 +6523,7 @@ public:
 
     // The hotkey was pressed. `stats` is sent first so the overlay never opens
     // with old numbers. `limitToApp` is the "Limit Overlay to Focused App" setting.
-    void toggle(const LiveStats& stats, bool limitToApp) {
+    void toggle(const LiveStats& stats, bool limitToApp, bool fahrenheit) {
         // Both hotkey sources can report the same press (X11 sessions where the
         // desktop also has the shortcut), so presses this close together count once.
         constexpr double kTogglePause = 0.3;
@@ -4819,11 +6531,11 @@ public:
         if (now - lastToggle_ < kTogglePause) return;
         lastToggle_ = now;
 
-        sendStats(stats);
+        sendStats(stats, fahrenheit);
         send(limitToApp ? "toggle app\n" : "toggle screen\n");
     }
 
-    void sendStats(const LiveStats& stats) { send(overlayStatsLine(stats)); }
+    void sendStats(const LiveStats& stats, bool fahrenheit) { send(overlayStatsLine(stats, fahrenheit)); }
 
     // The overlay draws itself in the same skin as the main window.
     void setSkin(Skin skin) { send(std::string("skin ") + skinChoice(skin).id + "\n"); }
@@ -4887,6 +6599,7 @@ struct GioApi {
     decltype(&g_variant_lookup) lookup{};
     decltype(&g_variant_lookup_value) lookupValue{};
     decltype(&g_variant_n_children) childCount{};
+    decltype(&g_variant_get_type_string) typeString{};
     decltype(&g_variant_unref) unref{};
     decltype(&g_main_context_new) newContext{};
     decltype(&g_main_context_push_thread_default) pushContext{};
@@ -4904,7 +6617,7 @@ struct GioApi {
                loadSymbol(library, "g_dbus_connection_signal_unsubscribe", signalUnsubscribe) &&
                loadSymbol(library, "g_variant_new_parsed", newParsed) && loadSymbol(library, "g_variant_get", get) &&
                loadSymbol(library, "g_variant_lookup", lookup) && loadSymbol(library, "g_variant_lookup_value", lookupValue) &&
-               loadSymbol(library, "g_variant_n_children", childCount) && loadSymbol(library, "g_variant_unref", unref) &&
+               loadSymbol(library, "g_variant_n_children", childCount) && loadSymbol(library, "g_variant_get_type_string", typeString) && loadSymbol(library, "g_variant_unref", unref) &&
                loadSymbol(library, "g_main_context_new", newContext) &&
                loadSymbol(library, "g_main_context_push_thread_default", pushContext) &&
                loadSymbol(library, "g_main_loop_new", newLoop) && loadSymbol(library, "g_main_loop_run", runLoop) &&
@@ -5075,6 +6788,104 @@ void runShortcutsPortal() {
     portal.run();
 }
 
+// ---- The desktop's light/dark style and accent colour --------------------------
+//
+// The GNOME skin follows the desktop, as GNOME apps do. Both settings come from
+// the desktop's Settings portal (GNOME, KDE and others have one), which also
+// announces when the user changes them. Without a portal the skin stays light,
+// in GNOME's default blue.
+
+std::atomic<bool> g_desktopDark{false};
+std::atomic<unsigned> g_desktopAccent{0x3584e4};   // 0xRRGGBB
+
+class AppearanceWatcher {
+public:
+    // Reads both settings now, then watches for changes on a thread of its own.
+    void start() {
+        if (!gio_.load()) return;
+        GError* error = nullptr;
+        bus_ = gio_.busGetSync(G_BUS_TYPE_SESSION, nullptr, &error);
+        if (!bus_) {
+            gio_.freeError(error);
+            return;
+        }
+        for (const char* key : {"color-scheme", "accent-color"}) {
+            if (GVariant* value = read(key)) {
+                store(key, value);
+                gio_.unref(value);
+            }
+        }
+        std::thread([this] { watch(); }).detach();
+    }
+
+private:
+    GVariant* call(const char* method, const char* key) {
+        GError* error = nullptr;
+        GVariant* reply = gio_.callSync(bus_, kPortalBusName, kPortalPath, "org.freedesktop.portal.Settings", method,
+                                        gio_.newParsed("('org.freedesktop.appearance', %s)", key), nullptr, G_DBUS_CALL_FLAGS_NONE,
+                                        1000, nullptr, &error);
+        if (!reply) gio_.freeError(error);
+        return reply;
+    }
+
+    // The value of an org.freedesktop.appearance setting (unref it when done), or nullptr.
+    GVariant* read(const char* key) {
+        GVariant* value = nullptr;
+        if (GVariant* reply = call("ReadOne", key)) {
+            gio_.get(reply, "(v)", &value);
+            gio_.unref(reply);
+        } else if (GVariant* oldReply = call("Read", key)) {   // older portals: the value is wrapped twice
+            GVariant* wrapped = nullptr;
+            gio_.get(oldReply, "(v)", &wrapped);
+            if (strcmp(gio_.typeString(wrapped), "v") == 0) gio_.get(wrapped, "v", &value);
+            gio_.unref(wrapped);
+            gio_.unref(oldReply);
+        }
+        return value;
+    }
+
+    void store(const char* key, GVariant* value) {
+        const std::string type = gio_.typeString(value);
+        if (strcmp(key, "color-scheme") == 0 && type == "u") {
+            guint32 scheme = 0;
+            gio_.get(value, "u", &scheme);
+            g_desktopDark = (scheme == 1);   // 1 = prefers dark; 0 (no preference) and 2 = light
+        } else if (strcmp(key, "accent-color") == 0 && type == "(ddd)") {
+            double red = -1.0, green = -1.0, blue = -1.0;
+            gio_.get(value, "(ddd)", &red, &green, &blue);
+            const auto valid = [](double c) { return c >= 0.0 && c <= 1.0; };   // outside 0..1 means "not set"
+            if (valid(red) && valid(green) && valid(blue)) {
+                const auto byte = [](double c) { return static_cast<unsigned>(c * 255.0 + 0.5); };
+                g_desktopAccent = byte(red) << 16 | byte(green) << 8 | byte(blue);
+            }
+        }
+    }
+
+    void watch() {
+        GMainContext* context = gio_.newContext();
+        gio_.pushContext(context);   // changes are delivered to this thread
+        GMainLoop* loop = gio_.newLoop(context, FALSE);
+        gio_.signalSubscribe(
+            bus_, kPortalBusName, "org.freedesktop.portal.Settings", "SettingChanged", kPortalPath, "org.freedesktop.appearance",
+            G_DBUS_SIGNAL_FLAGS_NONE,
+            [](GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*, GVariant* parameters, gpointer data) {
+                AppearanceWatcher& watcher = *static_cast<AppearanceWatcher*>(data);
+                const gchar* settingsNamespace = nullptr;
+                const gchar* key = nullptr;
+                GVariant* value = nullptr;
+                watcher.gio_.get(parameters, "(&s&sv)", &settingsNamespace, &key, &value);
+                watcher.store(key, value);
+                watcher.gio_.unref(value);
+                postRequest(kRequestAppearance);
+            },
+            this, nullptr);
+        gio_.runLoop(loop);
+    }
+
+    GioApi gio_;
+    GDBusConnection* bus_{nullptr};
+};
+
 // ---- One copy at a time ------------------------------------------------------
 //
 // Opening VeeaStats while it is already running (for example from the app menu
@@ -5232,6 +7043,10 @@ int main(int argc, char** argv) {
         height = std::min(height, mode->height);
     }
 
+    // Read before the window opens, so a borderless window never flashes its border.
+    const Settings savedSettings = loadSettings();
+    glfwWindowHint(GLFW_DECORATED, savedSettings.borderless ? GLFW_FALSE : GLFW_TRUE);
+
     GLFWwindow* window = glfwCreateWindow(width, height, "VeeaStats", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
@@ -5256,7 +7071,10 @@ int main(int argc, char** argv) {
 
     const UiFonts fonts = loadFonts();
     UiState ui;                                   // changed by the controls in the window
-    ui.settings = loadSettings();
+    ui.settings = savedSettings;
+    static AppearanceWatcher appearance;          // static: its thread uses it until the program ends
+    appearance.start();
+    setGnomeAppearance(g_desktopDark, rgbColor(g_desktopAccent));
     applySkin(ui.settings.skin, fonts);
     Settings appliedSettings = ui.settings;       // what the window currently looks like
     const HudSkins hudSkins = makeHudSkins(fonts);
@@ -5298,6 +7116,11 @@ int main(int argc, char** argv) {
             staticInfo = staticInfoReady.get();
             framesToDraw = 2;
         }
+        if (requests & kRequestAppearance) {      // the desktop switched between light and dark, or changed accent
+            setGnomeAppearance(g_desktopDark, rgbColor(g_desktopAccent));
+            if (ui.settings.skin == Skin::Gnome) applySkin(ui.settings.skin, fonts);
+            framesToDraw = 2;
+        }
         if (requests & kRequestShowWindow) {      // VeeaStats was opened again
             if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) glfwRestoreWindow(window);
             glfwShowWindow(window);
@@ -5308,7 +7131,7 @@ int main(int argc, char** argv) {
         if (requests & kRequestToggleOverlay) {
             monitorLive.refresh();                // fresh numbers in case it's opening
             lastRefresh = glfwGetTime();
-            overlay.toggle(monitorLive.stats(), ui.settings.limitOverlayToApp);
+            overlay.toggle(monitorLive.stats(), ui.settings.limitOverlayToApp, ui.settings.fahrenheit);
         }
 
         if (ui.quitRequested) break;
@@ -5326,7 +7149,7 @@ int main(int argc, char** argv) {
         if ((drawing || overlay.active()) && frameStart - lastRefresh >= ui.settings.refreshMs / 1000.0) {
             monitorLive.refresh();
             lastRefresh = glfwGetTime();
-            if (overlay.active()) overlay.sendStats(monitorLive.stats());
+            if (overlay.active()) overlay.sendStats(monitorLive.stats(), ui.settings.fahrenheit);
         }
 
         if (drawing) {
@@ -5343,6 +7166,12 @@ int main(int argc, char** argv) {
                     framesToDraw = 2;                 // lay the new skin out straight away
                 }
                 if (ui.settings.refreshMs != appliedSettings.refreshMs) monitorLive.setRefreshIntervalMs(ui.settings.refreshMs);
+                if (ui.settings.borderless != appliedSettings.borderless) {
+                    glfwSetWindowAttrib(window, GLFW_DECORATED, ui.settings.borderless ? GLFW_FALSE : GLFW_TRUE);
+                }
+                if (ui.settings.fahrenheit != appliedSettings.fahrenheit && overlay.active()) {
+                    overlay.sendStats(monitorLive.stats(), ui.settings.fahrenheit);   // switch its units now, not at the next refresh
+                }
                 saveSettings(ui.settings);
                 appliedSettings = ui.settings;
             }

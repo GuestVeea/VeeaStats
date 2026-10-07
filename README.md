@@ -1,14 +1,14 @@
 # VeeaStats
 
-A hardware monitor for Linux with five skins and an in-game overlay. See your CPU, memory and GPU load at a glance, check how full your drives are, and press **Ctrl+Shift+O** in a game to put those numbers in the corner of the screen.
+A hardware monitor for Linux with nine skins and an in-game overlay. See your CPU, memory and GPU load and temperatures at a glance, check how full your drives are, and press **Ctrl+Shift+O** in a game to put those numbers in the corner of the screen.
 
 ![VeeaStats in the JARV skin](docs/screenshots/jarv.png)
 
 ## Features
 
-- **In-game overlay:** press Ctrl+Shift+O to show CPU, memory and GPU load, plus CPU and GPU voltage, at the top-left of the game you're playing. It's see-through, never takes focus, and lets clicks through to the game.
-- **Five skins:** Classic, JARV, Galactic Conflict, Federation Gunship and Halloween. The overlay matches whichever skin you pick.
-- **Live readings:** load per CPU core, CPU clock and voltage (VCore), memory, and GPU load, VRAM, clock and voltage, updated every 250 ms to 2 seconds.
+- **In-game overlay:** press Ctrl+Shift+O to show CPU, memory and GPU load, plus CPU and GPU temperature and voltage, at the top-left of the game you're playing. It's see-through, never takes focus, and lets clicks through to the game.
+- **Nine skins:** Classic, JARV, Galactic Conflict, Federation Gunship, Halloween, Poseidon, Otaku, Cyber-Punk and Classroom. The overlay matches whichever skin you pick, and Classroom follows your desktop's light or dark style and accent colour.
+- **Live readings:** load per CPU core, CPU clock, voltage (VCore) and temperature, memory, and GPU load, VRAM, clock, voltage and temperature, updated every 250 ms to 2 seconds. Temperatures show in °C or °F.
 - **Storage usage:** click the hard-drive button at the top right to list your drives, then pick one to see a pie chart of its used and free space.
 - **Hardware details:** processor, motherboard and chipset, memory modules, drives, operating system, kernel, uptime and installed packages.
 - **All the major GPUs:** AMD, Intel and NVIDIA (through its driver's `nvidia-smi` tool), plus ARM Mali when built from source on ARM boards. With several GPUs, the busiest one is shown.
@@ -37,6 +37,14 @@ The overlay takes on the look of the active skin:
   </tr>
   <tr>
     <td><img src="docs/screenshots/overlay-halloween.png" alt="Halloween overlay" width="400"><br>Halloween</td>
+    <td><img src="docs/screenshots/overlay-poseidon.png" alt="Poseidon overlay" width="400"><br>Poseidon</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/overlay-otaku.png" alt="Otaku overlay" width="400"><br>Otaku</td>
+    <td><img src="docs/screenshots/overlay-cyberpunk.png" alt="Cyber-Punk overlay" width="400"><br>Cyber-Punk</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/overlay-classroom.png" alt="Classroom overlay" width="400"><br>Classroom</td>
     <td></td>
   </tr>
 </table>
@@ -78,6 +86,14 @@ Pick a skin from the gear menu at the top right. Every skin except Classic is an
   </tr>
   <tr>
     <td><img src="docs/screenshots/halloween.png" alt="Halloween skin" width="440"><br><b>Halloween</b>: stone slabs, cobwebs and glowing jack-o'-lanterns</td>
+    <td><img src="docs/screenshots/poseidon.png" alt="Poseidon skin" width="440"><br><b>Poseidon</b>: a stormy sea temple with gold Greek key trim, bronze shields with black-figure scenes, and lightning</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/otaku.png" alt="Otaku skin" width="440"><br><b>Otaku</b>: an anime game menu with tilted character cards and candy-coloured stat bars</td>
+    <td><img src="docs/screenshots/cyberpunk.png" alt="Cyber-Punk skin" width="440"><br><b>Cyber-Punk</b>: a neon-city HUD with hexagon gauges and a glitching title</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/classroom.png" alt="Classroom skin" width="440"><br><b>Classroom</b>: a clean desktop look in the style of GNOME apps, light or dark to match your desktop, in your accent colour</td>
     <td></td>
   </tr>
 </table>
@@ -119,6 +135,8 @@ The gear button at the top right opens the settings. Click the gear again, or an
 | Skin | Changes the look of the window and the overlay |
 | Animations | Turns the moving parts of the animated skins on or off |
 | Update Interval | How often the numbers refresh: 250 ms to 2 seconds (500 ms by default) |
+| Display Temperature in °F | Shows temperatures in Fahrenheit instead of Celsius. Click it again to go back to Celsius. |
+| Borderless | Hides the window's title bar and border. Move the window by holding Super and dragging it; close it with Alt+F4. Click it again to bring the border back. |
 | Limit Overlay to Focused App | On: the overlay opens on the focused game and follows it. Off: it stays in the screen corner. |
 | Keep VeeaStats running in the background | Closing the window hides it instead of quitting, so Ctrl+Shift+O keeps working. Open VeeaStats from the app menu to bring the window back, or choose **Quit VeeaStats** in this menu. |
 
@@ -161,4 +179,4 @@ To build the release AppImage, run `packaging/build-appimage.sh --container`. It
 
 VeeaStats is free software under the [GNU General Public License v3.0](LICENSE).
 
-It's built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT license) and [GLFW](https://www.glfw.org/) (zlib license). The skins use fonts released under the SIL Open Font License: Orbitron, Rajdhani, Michroma, Saira Semi Condensed, Press Start 2P, Tiny5, Henny Penny and Fredoka. See [fonts/README.md](fonts/README.md) for details and licenses.
+It's built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT license) and [GLFW](https://www.glfw.org/) (zlib license). The skins use fonts released under the SIL Open Font License: Orbitron, Rajdhani, Michroma, Saira Semi Condensed, Press Start 2P, Tiny5, Henny Penny, Fredoka, Cinzel, Marcellus, Dela Gothic One, M PLUS Rounded 1c, Chakra Petch and Inter. See [fonts/README.md](fonts/README.md) for details and licenses.

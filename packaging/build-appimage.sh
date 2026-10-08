@@ -48,7 +48,7 @@ cmake --build "$BUILD_DIR" -j"$(nproc)"
 
 # The release binary must carry its own C++ runtime (CMakeLists.txt links it
 # in when it can), or it would depend on each user's libstdc++ version.
-if objdump -p "$BUILD_DIR/CpuMonitor" | grep -q 'NEEDED.*libstdc++'; then
+if objdump -p "$BUILD_DIR/CpuMonitor" | grep 'NEEDED.*libstdc++' >/dev/null; then
     echo "error: CpuMonitor links libstdc++ dynamically; install the static libstdc++ (libstdc++-static / libstdc++-dev)" >&2
     exit 1
 fi
@@ -69,8 +69,14 @@ if ! echo "$LINUXDEPLOY_SHA256  $LINUXDEPLOY" | sha256sum --check --status 2>/de
 fi
 
 # Containers usually have no FUSE, so let linuxdeploy unpack itself instead.
+# It unpacks into $TMPDIR under a name anyone can predict (it's derived from the
+# pinned file), so in a shared /tmp another user could get there first and swap
+# in their own program. A private folder, removed afterwards, rules that out.
 export APPIMAGE_EXTRACT_AND_RUN=1
-export OUTPUT="$DIST_DIR/VeeaStats-x86_64.AppImage"
+TMPDIR="$(mktemp -d)"
+export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
+export LDAI_OUTPUT="$DIST_DIR/VeeaStats-x86_64.AppImage"
 # AppRun (packaging/AppRun) installs the app for the user on first open.
 # linuxdeploy copies any non-system libraries the binary needs into the AppImage;
 # OpenGL, X11 and glibc are deliberately left out and come from the user's system.
@@ -81,4 +87,4 @@ export OUTPUT="$DIST_DIR/VeeaStats-x86_64.AppImage"
     --output appimage
 
 echo
-echo "Built: $OUTPUT"
+echo "Built: $LDAI_OUTPUT"

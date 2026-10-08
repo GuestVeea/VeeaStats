@@ -3,14 +3,21 @@
 # user (no root needed), then starts VeeaStats:
 #   - copies the AppImage to ~/.local/share/veeastats/
 #   - adds a menu entry + icon, so desktops show the right icon in the taskbar
-#   - opening a different (newer) AppImage later replaces the installed copy
+#   - opening a different AppImage later replaces the installed copy
 #   - on desktop PCs, offers once to turn on the motherboard sensor driver (VCore)
 # Uninstall from the menu entry's right-click "Uninstall VeeaStats" action, or
 # run the AppImage with --uninstall. --install installs without starting it
 # (install.sh, in the repository, uses that).
+#
+# Exit codes of --install and --uninstall, for install.sh: 0 done, 1 failed,
+# 10 the user said no.
 
 HERE="$(dirname "$(readlink -f "$0")")"
-DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+# XDG_DATA_HOME only counts when it's an absolute path (as the XDG spec says).
+case "${XDG_DATA_HOME:-}" in
+    /*) DATA_HOME="$XDG_DATA_HOME" ;;
+    *)  DATA_HOME="$HOME/.local/share" ;;
+esac
 INSTALL_DIR="$DATA_HOME/veeastats"
 TARGET="$INSTALL_DIR/VeeaStats.AppImage"
 ICON="$INSTALL_DIR/veeastats.svg"
@@ -18,15 +25,27 @@ DESKTOP_FILE="$DATA_HOME/applications/veeastats.desktop"
 SENSOR_MARKER="$INSTALL_DIR/sensor-setup"                   # remembers the answer, so we ask once
 SENSOR_CONF="/etc/modules-load.d/veeastats-sensors.conf"   # loads the driver at every boot
 
+# pkexec looks a bare program name up in the caller's PATH, which the user (or
+# anything running as the user) controls. So pkexec itself and everything it
+# runs as root are named by their full system paths.
+PKEXEC=""
+for candidate in /usr/bin/pkexec /bin/pkexec; do
+    if [ -x "$candidate" ]; then PKEXEC="$candidate"; break; fi
+done
+
 notify() {
     command -v notify-send >/dev/null 2>&1 &&
         notify-send --app-name=VeeaStats --icon="$ICON" "VeeaStats" "$1" 2>/dev/null
 }
 
 # Asks yes/no ($1) with whatever dialog tool the desktop has: returns 0 for yes,
-# 1 for no. If no dialog can be shown (none installed, no display, or the tool
+# 1 for no. If no dialog can be shown (no display, none installed, or the tool
 # failed), returns $2 instead, so each caller decides what silence means.
 confirm() {
+    # Without a display (a terminal over SSH, a text console), a dialog tool
+    # either fails with the same code as "No" or opens on the desktop session
+    # instead, where nobody is looking. Neither is an answer.
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return "$2"
     if command -v zenity >/dev/null 2>&1; then
         zenity --question --title="VeeaStats" --text="$1" 2>/dev/null
         case $? in 0) return 0 ;; 1) return 1 ;; esac
@@ -86,16 +105,22 @@ is_laptop() {
     return 1
 }
 
-# Runs as root. Loads whichever driver finds a chip (nct6775 = Nuvoton, used by
-# ASUS/MSI/ASRock; it87 = ITE, used by Gigabyte). modprobe fails when the
-# driver finds no chip, so a success means it is working.
+# Runs as root. Tries each driver (nct6775 = Nuvoton, used by ASUS/MSI/ASRock;
+# it87 = ITE, used by Gigabyte) and keeps the first one that actually produces a
+# sensor: a driver can load and still find no usable chip (an ACPI resource
+# conflict, say), so loading alone proves nothing. Exit codes: 0 on, 2 no chip
+# found, 3 on now but the setting for future restarts couldn't be written.
 ROOT_ENABLE_SENSORS='
 for module in nct6775 it87; do
-    if modprobe "$module" 2>/dev/null; then
-        mkdir -p /etc/modules-load.d
-        echo "$module" > '"$SENSOR_CONF"'
-        exit 0
-    fi
+    modprobe "$module" 2>/dev/null || continue
+    for attempt in 1 2 3; do
+        if grep -qsE "^(nct6|it8)" /sys/class/hwmon/hwmon*/name; then
+            mkdir -p /etc/modules-load.d && echo "$module" > '"$SENSOR_CONF"' || exit 3
+            exit 0
+        fi
+        sleep 1
+    done
+    modprobe -r "$module" 2>/dev/null
 done
 exit 2'
 
@@ -105,7 +130,7 @@ setup_sensor_driver() {
     if has_voltage_source || is_laptop || [ "$(uname -m)" != "x86_64" ]; then
         return   # checked again next launch, in case the driver was only loaded by hand
     fi
-    command -v pkexec >/dev/null 2>&1 || return
+    [ -n "$PKEXEC" ] || return
 
     # Never ask for the root password without having explained why first: if
     # the question can't be shown, skip it (and ask again next launch).
@@ -117,62 +142,103 @@ This needs your password once. Turn it on?" 2
         1) echo "declined" > "$SENSOR_MARKER"; return 0 ;;
         *) return 0 ;;
     esac
-    pkexec sh -c "$ROOT_ENABLE_SENSORS"
+    "$PKEXEC" /bin/sh -c "$ROOT_ENABLE_SENSORS"
     case $? in
         0) echo "enabled" > "$SENSOR_MARKER"; notify "CPU voltage readings are now turned on." ;;
         2) echo "no-chip" > "$SENSOR_MARKER"; notify "No supported sensor chip was found, so CPU voltage will show as N/A." ;;
-        *) echo "declined" > "$SENSOR_MARKER" ;;   # password prompt cancelled
+        # The driver is loaded for now, but it couldn't be set to load at startup:
+        # no answer is saved, so this is offered again after a restart.
+        3) notify "CPU voltage readings are on for now, but couldn't be turned on for future restarts." ;;
+        126) echo "declined" > "$SENSOR_MARKER" ;;   # password prompt cancelled
+        # 127: no password prompt could be shown (no polkit agent running, as on
+        # some tiling desktops), or the password was refused. Nothing is saved,
+        # so it's offered again next time; "No" in the question above is final.
+        *) notify "Couldn't ask for your password, so CPU voltage stays off for now." ;;
     esac
 }
 
 if [ "$1" = "--uninstall" ]; then
-    confirm "Remove VeeaStats from this computer?" 0 || exit 0   # the user asked for this, so no dialog means yes
+    confirm "Remove VeeaStats from this computer?" 0 || exit 10   # the user asked for this, so no dialog means yes
     "$HERE/usr/bin/CpuMonitor" --quit 2>/dev/null   # close it if it's running in the background
-    # Ask for the password only if the installer turned the driver on.
-    [ -f "$SENSOR_CONF" ] && command -v pkexec >/dev/null 2>&1 && pkexec rm -f "$SENSOR_CONF"
-    rm -f "$DESKTOP_FILE" "$TARGET" "$ICON" "$SENSOR_MARKER"
+    # Ask for the password only if this user's install turned the driver on
+    # (on a shared PC, another user's VeeaStats may be the one relying on it).
+    # If that removal is cancelled, the marker stays, so the setting isn't
+    # forgotten: reinstalling and uninstalling again can still remove it.
+    sensor_conf_left=""
+    if [ "$(cat "$SENSOR_MARKER" 2>/dev/null)" = enabled ] && [ -f "$SENSOR_CONF" ]; then
+        [ -n "$PKEXEC" ] && "$PKEXEC" /bin/rm -f -- "$SENSOR_CONF"
+        [ -f "$SENSOR_CONF" ] && sensor_conf_left=yes
+    fi
+    rm -f "$DESKTOP_FILE" "$TARGET" "$ICON"
+    [ -n "$sensor_conf_left" ] || rm -f "$SENSOR_MARKER"
     rmdir "$INSTALL_DIR" 2>/dev/null
     command -v update-desktop-database >/dev/null 2>&1 &&
         update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null
-    command -v notify-send >/dev/null 2>&1 &&
-        notify-send --app-name=VeeaStats "VeeaStats" "VeeaStats has been uninstalled." 2>/dev/null
+    if [ -e "$TARGET" ]; then
+        echo "Couldn't remove $TARGET." >&2
+        notify "Couldn't remove VeeaStats: $TARGET is still there."
+        exit 1
+    fi
+    if [ -n "$sensor_conf_left" ]; then
+        message="VeeaStats has been uninstalled. The sensor driver still loads at startup; to stop that, run: sudo rm $SENSOR_CONF"
+    else
+        message="VeeaStats has been uninstalled."
+    fi
+    echo "$message"
+    notify "$message"
     exit 0
 fi
 
 # $APPIMAGE is set by the AppImage runtime; it's missing when run from an
 # extracted folder, in which case there is nothing to install.
+copy_failed=""
 if [ -n "$APPIMAGE" ] && [ "$(readlink -f "$APPIMAGE")" != "$(readlink -f "$TARGET")" ]; then
+    # cksum, not cmp: cmp is missing on minimal systems (Arch without diffutils),
+    # and every launch would then count as an update.
     if [ ! -f "$TARGET" ]; then message="Installed. You can now open VeeaStats from your app menu."
-    elif ! cmp -s "$APPIMAGE" "$TARGET"; then message="Updated to the version you just opened."
+    elif [ "$(cksum < "$APPIMAGE")" != "$(cksum < "$TARGET")" ]; then message="Updated to the version you just opened."
     else message=""
     fi
     if [ -n "$message" ]; then
-        mkdir -p "$INSTALL_DIR"
-        # Copy to a temp name first so a running copy is never left half-written.
-        cp "$APPIMAGE" "$TARGET.new" && chmod +x "$TARGET.new" && mv -f "$TARGET.new" "$TARGET"
-        cp "$HERE/veeastats.svg" "$ICON"
-        write_menu_entry
-        notify "$message"
+        # Copy to a temp file of its own first, so a running copy is never left
+        # half-written and two AppImages opened at once can't mix their copies.
+        tmp=""
+        if mkdir -p "$INSTALL_DIR" && tmp="$(mktemp "$INSTALL_DIR/.VeeaStats.XXXXXX")" &&
+            cp "$APPIMAGE" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$TARGET"; then
+            cp "$HERE/veeastats.svg" "$ICON"
+            write_menu_entry
+            notify "$message"
+        else
+            [ -n "$tmp" ] && rm -f "$tmp"
+            copy_failed=yes
+            if [ "$1" != "--install" ]; then
+                notify "Couldn't install VeeaStats into $INSTALL_DIR (is the disk full?). Running it from here instead."
+            fi
+        fi
     fi
 fi
 
-# Running the installed copy: restore the menu entry if someone deleted it.
+# The menu entry was deleted (or an install was interrupted): put it back.
 if [ -n "$APPIMAGE" ] && [ -f "$TARGET" ] && [ ! -f "$DESKTOP_FILE" ]; then
     [ -f "$ICON" ] || cp "$HERE/veeastats.svg" "$ICON"
     write_menu_entry
 fi
 
-[ -n "$APPIMAGE" ] && setup_sensor_driver
-
-# --install (used by install.sh): install or update, then stop without starting VeeaStats.
+# --install (used by install.sh): install or update, then stop without starting
+# VeeaStats. The sensor question waits for the first launch from the menu: a
+# terminal may have no display to ask on (an SSH session, say).
 if [ "$1" = "--install" ]; then
-    if [ -f "$TARGET" ]; then
-        echo "VeeaStats is installed. Open it from your app menu, or run: $TARGET"
-    else
+    if [ -z "$APPIMAGE" ]; then
         echo "Nothing installed: run this from the AppImage itself." >&2
         exit 1
+    elif [ -n "$copy_failed" ]; then
+        echo "Couldn't install VeeaStats into $INSTALL_DIR (is the disk full, or the folder read-only?)." >&2
+        exit 1
     fi
+    echo "VeeaStats is installed. Open it from your app menu, or run: $TARGET"
     exit 0
 fi
+
+[ -n "$APPIMAGE" ] && setup_sensor_driver
 
 exec "$HERE/usr/bin/CpuMonitor" "$@"

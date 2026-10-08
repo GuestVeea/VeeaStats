@@ -34,6 +34,7 @@
 // GLib are loaded at runtime, so they aren't needed to start the program.
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
+#include <X11/XKBlib.h>
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <gio/gio.h>
@@ -63,7 +64,9 @@
 #include <spawn.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
@@ -75,6 +78,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <cctype>
@@ -152,6 +156,10 @@ bool startsWith(std::string_view text, std::string_view prefix) {
     return text.substr(0, prefix.size()) == prefix;
 }
 
+bool endsWith(std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
+}
+
 // Removes spaces, tabs, newlines and double quotes from both ends.
 // (Quotes are stripped so values like PRETTY_NAME="Arch Linux" come out clean.)
 std::string trim(std::string_view text) {
@@ -172,21 +180,38 @@ bool fileExists(const std::string& path) {
     return access(path.c_str(), F_OK) == 0;
 }
 
-// True if `name` is an executable somewhere on $PATH (replaces `which`).
-bool commandExists(const char* name) {
+// A per-user folder from the XDG spec: $`variable` if it's an absolute path (the
+// spec says relative ones are to be ignored), else ~/`fallback`. "" if neither.
+std::string xdgDirectory(const char* variable, const char* fallback) {
+    const char* value = getenv(variable);
+    if (value && value[0] == '/') return value;
+    const char* home = getenv("HOME");
+    return (home && *home) ? std::string(home) + "/" + fallback : "";
+}
+
+// The full path of program `name` found on $PATH, or "" (replaces `which`).
+// Empty PATH entries are skipped: they mean "the current folder", from which no
+// program should ever be run. Programs are started by this path (not looked up
+// again by name), so what was checked is what runs.
+std::string findCommand(const char* name) {
     const char* pathEnv = getenv("PATH");
-    if (!pathEnv) return false;
+    if (!pathEnv) return "";
 
     std::string_view dirs(pathEnv);
     while (!dirs.empty()) {
         const size_t colon = dirs.find(':');
         const std::string dir(dirs.substr(0, colon));
-        if (!dir.empty() && access((dir + "/" + name).c_str(), X_OK) == 0) return true;
+        if (!dir.empty() && dir[0] == '/') {
+            const std::string path = dir + "/" + name;
+            if (access(path.c_str(), X_OK) == 0) return path;
+        }
         if (colon == std::string_view::npos) break;
         dirs.remove_prefix(colon + 1);
     }
-    return false;
+    return "";
 }
+
+bool commandExists(const char* name) { return !findCommand(name).empty(); }
 
 // Calls onLine(const char* line) for every line of an open stream (newline removed).
 // The callback returns kKeepGoing to continue or kStop to stop early.
@@ -223,6 +248,29 @@ void forEachCommandLine(const char* command, Callback onLine) {
     pclose(pipe);
 }
 
+// Makes reads/writes on `fd` return straight away instead of waiting, keeping
+// its other flags.
+void setNonBlocking(int fd) {
+    const int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Ends child process `pid` (with `group`, also every process it started, in
+// the process group it leads), waiting about a second at most: a child stuck
+// in a driver call must not freeze the window or keep VeeaStats from quitting.
+// SIGTERM first, then SIGKILL. A child still there after that is stuck inside
+// the kernel and can't be ended from here; it's left behind (and reaped by
+// init once VeeaStats exits).
+void endChildProcess(pid_t pid, bool group) {
+    for (const int signal : {SIGTERM, SIGKILL}) {
+        kill(group ? -pid : pid, signal);
+        for (int wait = 0; wait < 50; ++wait) {
+            if (waitpid(pid, nullptr, WNOHANG) != 0) return;   // gone (or not ours to wait for)
+            usleep(10 * 1000);
+        }
+    }
+}
+
 // First line of a (small) file such as a sysfs entry, trimmed. "" if unreadable.
 std::string readFirstLine(const std::string& path) {
     std::string result;
@@ -238,7 +286,7 @@ bool parseNumber(const std::string& text, double& out) {
     if (text.empty()) return false;
     char* end = nullptr;
     const double value = strtod(text.c_str(), &end);
-    if (end == text.c_str()) return false;
+    if (end == text.c_str() || !std::isfinite(value)) return false;   // "nan" and "inf" parse too, but aren't numbers we can show
     out = value;
     return true;
 }
@@ -292,14 +340,25 @@ double readVoltage(const std::string& path) {
     return (millivolts > 100.0 && millivolts < 2500.0) ? millivolts / 1000.0 : 0.0;
 }
 
+// A temperature that isn't known (no sensor). NaN, not 0: below-freezing
+// readings are real (a board outdoors, a cold start).
+constexpr double kNoTemperature = std::numeric_limits<double>::quiet_NaN();
+constexpr double kMinTemperatureC = -40.0, kMaxTemperatureC = 150.0;   // anything outside is a broken sensor
+
+bool hasTemperature(double celsius) { return !std::isnan(celsius); }
+
+// True for a plausible sensor reading. Exactly 0 is left out: that's what
+// many drivers report for a sensor that is switched off or missing.
+bool isRealTemperature(double celsius) { return celsius > kMinTemperatureC && celsius < kMaxTemperatureC && celsius != 0.0; }
+
 // Reads a temperature sensor file (millidegrees Celsius) and returns °C. Returns
 // 0 if the file is missing or holds an implausible number (unused inputs read 0,
 // and some report junk such as -128).
 double readTemperature(const std::string& path) {
     double millidegrees = 0.0;
-    if (path.empty() || !readNumber(path, millidegrees)) return 0.0;
+    if (path.empty() || !readNumber(path, millidegrees)) return kNoTemperature;
     const double celsius = millidegrees / 1000.0;
-    return (celsius > 0.0 && celsius < 150.0) ? celsius : 0.0;
+    return isRealTemperature(celsius) ? celsius : kNoTemperature;
 }
 
 // The temperature file of the first thermal zone whose type contains one of
@@ -349,8 +408,10 @@ enum class GpuVendor { Unknown, Nvidia, Amd, Intel, Mali };
 
 // Cumulative CPU time counters (in "jiffies") for one core, from /proc/stat.
 struct CpuTimes {
-    unsigned long long active{0};
-    unsigned long long total{0};
+    int id{-1};                      // the core's number: "cpu<id>" in /proc/stat
+    unsigned long long active{0};    // ticks spent working
+    unsigned long long idle{0};      // ticks spent idle
+    unsigned long long iowait{0};    // ticks spent idle waiting for a disk (kept apart: the kernel may lower it)
 };
 
 struct RamStats {
@@ -371,7 +432,7 @@ struct GpuStats {
     double vramTotalGb{0.0};
     double clockGhz{0.0};
     double voltageV{0.0};
-    double temperatureC{0.0};     // 0 = no sensor
+    double temperatureC{kNoTemperature};
     bool hasLoad{false};          // gpuUsage is valid
     bool loadIsEstimate{false};   // ...but only approximate (Intel)
     bool hasMemory{false};        // the vram... numbers are valid
@@ -418,10 +479,11 @@ struct StaticInfo {
 
 // Things that are re-read every refresh.
 struct LiveStats {
-    std::vector<float> cpuPercent;   // one entry per core
+    std::vector<float> cpuPercent;   // one entry per online core
+    std::vector<int> cpuIds;         // each one's number (cores can be offline, so not always 0, 1, 2...)
     double cpuFreqGhz{0.0};
     double cpuVoltage{0.0};
-    double cpuTemperatureC{0.0};   // 0 = no sensor
+    double cpuTemperatureC{kNoTemperature};
     RamStats ram;
     GpuStats gpu;
     std::string uptime{"N/A"};
@@ -475,7 +537,17 @@ std::string chipsetFromBoardName(const std::string& boardName) {
             const size_t digitsStart = pos;
             while (pos < token.size() && std::isdigit(static_cast<unsigned char>(token[pos]))) ++pos;
             const size_t digitCount = pos - digitsStart;
-            if (digitCount < 2 || digitCount > 3) continue;
+            // Only numbers chipsets really have, so laptop board names like
+            // "X515EA" or "W65_W67RB" aren't taken for one: TRX40/WRX90; three
+            // digits ending in 0 (B650, Z790, W680), or X299/X399; or two digits
+            // from 6 up on older Intel boards (Z97, H81, X99).
+            const std::string_view digits(token.data() + digitsStart, digitCount);
+            const bool longPrefix = std::strlen(prefix) == 3;
+            const bool plausible =
+                longPrefix ? digitCount == 2
+                : digitCount == 3 ? (digits.back() == '0' || (prefix[0] == 'X' && (digits == "299" || digits == "399")))
+                : digitCount == 2 && digits[0] >= '6' && std::strchr("BHQXZ", prefix[0]) != nullptr;
+            if (!plausible) continue;
 
             // "E" is part of the chipset (X670E); a single trailing letter after
             // that is a form factor (B650M = micro-ATX, B650I = mini-ITX).
@@ -633,12 +705,15 @@ std::string describeRamModule(size_t index, const RamModule& module) {
     return label;
 }
 
-// DIMM details live in the BIOS tables, which only root can read, so this needs
-// dmidecode run as root (or via passwordless sudo). If that isn't possible the
-// UI just shows "Standard System RAM".
+// DIMM details live in the BIOS tables, which only root can read, so dmidecode
+// is only run when VeeaStats itself runs as root. (Not through "sudo -n": every
+// launch would log a failed root attempt in the system journal, and where sudo
+// needs no password it would quietly run a root program nobody agreed to.)
+// Otherwise the UI just shows "Standard System RAM".
 std::vector<std::string> readRamModuleLabels() {
-    const char* command = (geteuid() == 0) ? "dmidecode -t memory 2>/dev/null"
-                                           : "sudo -n dmidecode -t memory 2>/dev/null";
+    const std::string dmidecode = (geteuid() == 0) ? findCommand("dmidecode") : "";
+    const bool canRead = !dmidecode.empty() && dmidecode.find('\'') == std::string::npos;   // quoted below
+    const std::string command = "'" + dmidecode + "' -t memory 2>/dev/null";
     std::vector<RamModule> modules;
     RamModule current;
     bool inDevice = false;
@@ -650,7 +725,7 @@ std::vector<std::string> readRamModuleLabels() {
         current = RamModule();
     };
 
-    forEachCommandLine(command, [&](const char* line) {
+    if (canRead) forEachCommandLine(command.c_str(), [&](const char* line) {
         const std::string text = trim(line);
         if (text == "Memory Device") {
             finishDevice();
@@ -723,7 +798,8 @@ int countPacman() {
 int countDpkg() {
     int count = 0;
     forEachLine("/var/lib/dpkg/status", [&](const char* line) {
-        if (strcmp(line, "Status: install ok installed") == 0) ++count;
+        // "Status: install ok installed", or "hold ok installed" for a held package.
+        if (startsWith(line, "Status: ") && endsWith(line, " ok installed")) ++count;
         return kKeepGoing;
     });
     return count;
@@ -731,9 +807,10 @@ int countDpkg() {
 
 int countRpm() {
     // The rpm database is a binary format, so ask rpm itself.
-    if (!commandExists("rpm")) return 0;
+    const std::string rpm = findCommand("rpm");
+    if (rpm.empty() || rpm.find('\'') != std::string::npos) return 0;   // quoted below
     int count = 0;
-    forEachCommandLine("rpm -qa 2>/dev/null", [&](const char*) {
+    forEachCommandLine(("'" + rpm + "' -qa 2>/dev/null").c_str(), [&](const char*) {
         ++count;
         return kKeepGoing;
     });
@@ -743,10 +820,8 @@ int countRpm() {
 int countFlatpak() {
     // Counts installed apps (not runtimes), system-wide and per-user.
     int count = countSubdirectories("/var/lib/flatpak/app");   // note: only app *ids*, not arch/branch
-    const char* dataHome = getenv("XDG_DATA_HOME");
-    const char* home = getenv("HOME");
-    if (dataHome && *dataHome)  count += countSubdirectories(std::string(dataHome) + "/flatpak/app");
-    else if (home && *home)     count += countSubdirectories(std::string(home) + "/.local/share/flatpak/app");
+    const std::string dataHome = xdgDirectory("XDG_DATA_HOME", ".local/share");
+    if (!dataHome.empty()) count += countSubdirectories(dataHome + "/flatpak/app");
     return count;
 }
 
@@ -803,13 +878,18 @@ std::vector<CpuTimes> readCpuTimes() {
         if (!startsWith(line, "cpu")) return kStop;   // past the CPU lines (and their long "intr" neighbour)
         if (!isdigit(static_cast<unsigned char>(line[3]))) return kKeepGoing;
 
+        int id = -1;
         unsigned long long user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
-        sscanf(line, "cpu%*u %llu %llu %llu %llu %llu %llu %llu %llu",
-               &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+        if (sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &id, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal) < 5) {
+            return kKeepGoing;
+        }
 
         CpuTimes times;
-        times.active = user + nice + system + irq + softirq + steal;
-        times.total  = times.active + idle + iowait;   // guest time is already counted inside user/nice
+        times.id = id;
+        times.active = user + nice + system + irq + softirq + steal;   // guest time is already counted inside user/nice
+        times.idle   = idle;
+        times.iowait = iowait;
         cores.push_back(times);
         return kKeepGoing;
     });
@@ -832,6 +912,9 @@ double readCpuFreqGhz() {
     return mhz / 1000.0;
 }
 
+// The hwmon drivers of CPUs' own sensors (AMD, AMD via zenpower, Intel, ARM boards).
+constexpr const char* kCpuSensorNames[] = {"k10temp", "zenpower", "coretemp", "cpu_thermal"};
+
 // Finds the sensor files that might report CPU core voltage, best guess first.
 // Done once at startup so each refresh only reads a couple of tiny files.
 //   1. Any voltage whose label names the CPU core (zenpower "SVI2_Core",
@@ -841,7 +924,6 @@ double readCpuFreqGhz() {
 //      their own, so on those this is the only source.
 //   3. Unlabelled inputs of CPU sensors.
 std::vector<std::string> findCpuVoltageInputs() {
-    static const char* const kCpuSensorNames[] = {"k10temp", "zenpower", "coretemp", "cpu_thermal"};
     static const char* const kSuperIoPrefixes[] = {"nct6", "it8", "w836"};
     static const char* const kCoreLabels[] = {"vcore", "cpu core", "svi2_core", "vddcr_cpu", "cpu vcore"};
 
@@ -895,7 +977,6 @@ double readCpuVoltage(const std::vector<std::string>& inputs) {
 //   ARM boards: cpu_thermal.
 //   Anything else: a thermal zone the kernel names after the CPU.
 std::string findCpuTemperatureInput() {
-    static const char* const kCpuSensorNames[] = {"k10temp", "zenpower", "coretemp", "cpu_thermal"};
     static const char* const kBestLabels[] = {"tdie", "tctl", "package id 0"};   // in order of preference
     constexpr int kUnlabelled = 3, kOtherLabel = 4;                               // then these
 
@@ -1019,22 +1100,28 @@ public:
     bool running() const { return fd_ >= 0; }
 
     // Starts (or restarts) nvidia-smi so it prints a line per GPU every
-    // `intervalMs`. Doesn't wait for the first lines: the window never stalls,
-    // and the GPU numbers appear at the next refresh.
+    // `intervalMs`. Doesn't wait for the first lines, and the GPU numbers
+    // appear at the next refresh.
     bool start(int intervalMs) {
         stop();
         buffer_.clear();
+        const std::string program = findCommand("nvidia-smi");
+        if (program.empty()) return false;   // nvidia-smi isn't installed
 
         int pipeEnds[2];
-        if (pipe(pipeEnds) != 0) return false;
+        if (pipe2(pipeEnds, O_CLOEXEC) != 0) return false;   // CLOEXEC: other programs started meanwhile mustn't inherit it
 
-        // Child process: stdout -> our pipe, stderr -> /dev/null.
+        // Child process: stdout -> our pipe, stderr -> /dev/null. In a process
+        // group of its own, so stopping it also stops anything it started (it
+        // may be a wrapper script).
         posix_spawn_file_actions_t actions;
         posix_spawn_file_actions_init(&actions);
         posix_spawn_file_actions_adddup2(&actions, pipeEnds[1], STDOUT_FILENO);
         posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-        posix_spawn_file_actions_addclose(&actions, pipeEnds[0]);
-        posix_spawn_file_actions_addclose(&actions, pipeEnds[1]);
+        posix_spawnattr_t attributes;
+        posix_spawnattr_init(&attributes);
+        posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+        posix_spawnattr_setpgroup(&attributes, 0);
 
         const std::string loopArgument = "--loop-ms=" + std::to_string(intervalMs);
         const char* const args[] = {
@@ -1043,37 +1130,48 @@ public:
             "--format=csv,noheader,nounits",
             loopArgument.c_str(),
             nullptr};
-        const int result = posix_spawnp(&pid_, "nvidia-smi", &actions, nullptr, const_cast<char* const*>(args), environ);
+        const int result = posix_spawn(&pid_, program.c_str(), &actions, &attributes, const_cast<char* const*>(args), environ);
+        posix_spawnattr_destroy(&attributes);
         posix_spawn_file_actions_destroy(&actions);
         close(pipeEnds[1]);
 
-        if (result != 0) {   // nvidia-smi isn't installed
+        if (result != 0) {
             close(pipeEnds[0]);
             pid_ = -1;
             return false;
         }
-
         fd_ = pipeEnds[0];
-        fcntl(fd_, F_SETFL, O_NONBLOCK);   // reading must never freeze the UI
-        fcntl(fd_, F_SETFD, FD_CLOEXEC);
+        setNonBlocking(fd_);   // reading must never wait for nvidia-smi
         return true;
     }
 
-    // Returns the complete lines printed since the last call (none if nothing new).
+    // Returns the newest complete lines printed since the last call (none if
+    // nothing new). Bounded however much it prints (a broken or fake nvidia-smi
+    // can print without end, or without newlines): at most kMaxReadBytes read
+    // per call, at most kMaxLineBytes kept of an unfinished line, and only the
+    // newest kMaxLines lines returned.
     std::vector<std::string> newLines() {
+        constexpr size_t kMaxReadBytes = 64 * 1024, kMaxLineBytes = 4096, kMaxLines = 64;
         std::vector<std::string> lines;
         if (fd_ < 0) return lines;
 
-        char chunk[512];
-        ssize_t bytes;
-        while ((bytes = read(fd_, chunk, sizeof(chunk))) > 0) buffer_.append(chunk, static_cast<size_t>(bytes));
+        char chunk[4096];
+        size_t total = 0;
+        ssize_t bytes = -1;
+        while (total < kMaxReadBytes && (bytes = read(fd_, chunk, sizeof(chunk))) > 0) {
+            buffer_.append(chunk, static_cast<size_t>(bytes));
+            total += static_cast<size_t>(bytes);
+        }
         if (bytes == 0) stop();   // nvidia-smi exited
 
-        size_t newline;
-        while ((newline = buffer_.find('\n')) != std::string::npos) {
-            lines.push_back(buffer_.substr(0, newline));
-            buffer_.erase(0, newline + 1);
+        size_t lineStart = 0, newline;
+        while ((newline = buffer_.find('\n', lineStart)) != std::string::npos) {
+            if (newline - lineStart <= kMaxLineBytes) lines.emplace_back(buffer_, lineStart, newline - lineStart);
+            lineStart = newline + 1;
         }
+        buffer_.erase(0, lineStart);
+        if (buffer_.size() > kMaxLineBytes) buffer_.clear();   // no line is this long: it's garbage
+        if (lines.size() > kMaxLines) lines.erase(lines.begin(), lines.end() - kMaxLines);
         return lines;
     }
 
@@ -1084,21 +1182,21 @@ private:
             fd_ = -1;
         }
         if (pid_ > 0) {
-            kill(pid_, SIGTERM);
-            waitpid(pid_, nullptr, 0);
+            endChildProcess(pid_, true);   // never waits long (see there)
             pid_ = -1;
         }
     }
 
     pid_t pid_{-1};
     int fd_{-1};
-    std::string buffer_;
+    std::string buffer_;   // the start of a line that hasn't finished arriving
 };
 
-// Parses one line like "0, NVIDIA GeForce RTX 3080, 12, 1500, 10240, 1800"
-// (index, name, GPU %, VRAM used MiB, VRAM total MiB, clock MHz) into `gpu`.
-// Each field stands alone: one nvidia-smi can't report ("[N/A]", "[Not
-// Supported]") is just left out. Returns false if the line isn't a GPU line.
+// Parses one line like "0, NVIDIA GeForce RTX 3080, 12, 1500, 10240, 1800, 64"
+// (index, name, GPU %, VRAM used MiB, VRAM total MiB, clock MHz, temperature
+// °C) into `gpu`. Each field stands alone: one nvidia-smi can't report
+// ("[N/A]", "[Not Supported]") is just left out, and so is one out of range.
+// Returns false if the line isn't a GPU line.
 bool parseNvidiaLine(const std::string& line, int& index, GpuStats& gpu) {
     std::vector<std::string> fields;
     size_t start = 0;
@@ -1109,30 +1207,36 @@ bool parseNvidiaLine(const std::string& line, int& index, GpuStats& gpu) {
         start = comma + 1;
     }
     double number = 0.0;
-    if (fields.size() < 6 || !parseNumber(fields[0], number)) return false;
+    constexpr int kMaxGpus = 64;
+    if (fields.size() < 6 || !parseNumber(fields[0], number) || number < 0.0 || number >= kMaxGpus) return false;
     index = static_cast<int>(number);
 
     gpu = GpuStats();
     gpu.vendor = GpuVendor::Nvidia;
     if (!fields[1].empty() && fields[1][0] != '[') gpu.name = fields[1];
     double usage = 0.0, usedMb = 0.0, totalMb = 0.0, clockMhz = 0.0;
-    if (parseNumber(fields[2], usage)) {
+    if (parseNumber(fields[2], usage) && usage >= 0.0 && usage <= 100.0) {
         gpu.gpuUsage = static_cast<float>(usage);
         gpu.hasLoad = true;
     }
-    if (parseNumber(fields[3], usedMb) && parseNumber(fields[4], totalMb) && totalMb > 0.0) {
+    if (parseNumber(fields[3], usedMb) && parseNumber(fields[4], totalMb) && totalMb > 0.0 && usedMb >= 0.0 && usedMb <= totalMb) {
         gpu.hasMemory = true;
         gpu.vramUsedGb  = usedMb / 1024.0;
         gpu.vramTotalGb = totalMb / 1024.0;
         gpu.vramUsage   = static_cast<float>(100.0 * usedMb / totalMb);
     }
-    if (parseNumber(fields[5], clockMhz)) gpu.clockGhz = clockMhz / 1000.0;
+    if (parseNumber(fields[5], clockMhz) && clockMhz >= 0.0) gpu.clockGhz = clockMhz / 1000.0;
     double celsius = 0.0;
-    if (fields.size() > 6 && parseNumber(fields[6], celsius) && celsius > 0.0) gpu.temperatureC = celsius;
+    if (fields.size() > 6 && parseNumber(fields[6], celsius) && isRealTemperature(celsius)) {
+        gpu.temperatureC = celsius;
+    }
     return true;
 }
 
 // ---- GPU: helpers shared by the AMD / Intel / Mali readers -------------------
+
+// Shown instead of a load the GPU's driver doesn't report.
+constexpr const char* kLoadNotReported = "Core load: not reported by driver";
 
 // Every GPU appears as a folder like "/sys/class/drm/card0". This lists them,
 // skipping display outputs ("card0-DP-1") and render nodes ("renderD128").
@@ -1241,7 +1345,7 @@ GpuStats readAmdCard(const AmdCard& card) {
         gpu.gpuUsage = static_cast<float>(value);
         gpu.hasLoad = true;
     } else {
-        gpu.loadNote = "Core load: not reported by driver";
+        gpu.loadNote = kLoadNotReported;
     }
 
     if (card.vramTotalGb > 0.0 && readNumber(card.vramUsedPath, value)) {
@@ -1340,7 +1444,7 @@ GpuStats readIntelCard(IntelCard& card) {
 
     double idleMs = 0.0;
     if (card.idleCounterPath.empty() || !readNumber(card.idleCounterPath, idleMs)) {
-        gpu.loadNote = "Core load: not reported by driver";
+        gpu.loadNote = kLoadNotReported;
         return gpu;
     }
 
@@ -1454,7 +1558,7 @@ GpuStats readMaliGpu(const MaliGpu& mali) {
         gpu.gpuUsage = static_cast<float>(value);
         gpu.hasLoad = true;
     } else {
-        gpu.loadNote = "Core load: not reported by driver";
+        gpu.loadNote = kLoadNotReported;
     }
     return gpu;
 }
@@ -1525,10 +1629,17 @@ private:
     // nvidia-smi prints a line per GPU each interval; the newest reading of each
     // GPU is kept, and the busiest is shown (as for AMD and Intel).
     GpuStats readNvidia() {
+        const double now = monotonicMs();
         for (const std::string& line : nvidia_.newLines()) {
             int index = 0;
             GpuStats gpu;
-            if (parseNvidiaLine(line, index, gpu)) nvidiaCards_[index] = gpu;
+            if (parseNvidiaLine(line, index, gpu)) nvidiaCards_[index] = {gpu, now};
+        }
+        // A card nvidia-smi stopped listing (an eGPU unplugged, a card that fell
+        // off the bus) is dropped after a few missed updates, not shown frozen.
+        const double staleMs = std::max(3.0 * nvidiaIntervalMs_, 3000.0);
+        for (auto card = nvidiaCards_.begin(); card != nvidiaCards_.end();) {
+            card = (now - card->second.seenMs > staleMs) ? nvidiaCards_.erase(card) : std::next(card);
         }
         if (!nvidia_.running()) {
             // nvidia-smi isn't installed, or has stopped (after a driver hiccup,
@@ -1544,7 +1655,7 @@ private:
             return unavailable;
         }
         std::vector<GpuStats> cards;
-        for (const auto& [index, gpu] : nvidiaCards_) cards.push_back(gpu);
+        for (const auto& [index, card] : nvidiaCards_) cards.push_back(card.stats);
         const GpuStats busiest = pickBusiest(cards);
         if (busiest.name != GpuStats().name) nvidiaName_ = busiest.name;   // remembered for while it's unavailable
         return busiest;
@@ -1554,7 +1665,11 @@ private:
     int nvidiaIntervalMs_;
     NvidiaSmiStream nvidia_;
     double lastNvidiaStartMs_{0.0};
-    std::map<int, GpuStats> nvidiaCards_;   // newest reading per GPU index
+    struct NvidiaCard {
+        GpuStats stats;
+        double seenMs{0.0};   // when nvidia-smi last listed it (monotonicMs)
+    };
+    std::map<int, NvidiaCard> nvidiaCards_;   // newest reading per GPU index
     std::string nvidiaName_{GpuStats().name};
     std::vector<AmdCard> amdCards_;
     std::vector<IntelCard> intelCards_;
@@ -1570,6 +1685,7 @@ public:
         : previousCpu_(readCpuTimes()), cpuVoltageInputs_(findCpuVoltageInputs()),
           cpuTemperatureInput_(findCpuTemperatureInput()), gpu_(refreshMs) {
         stats_.cpuPercent.assign(previousCpu_.size(), 0.0f);
+        for (const CpuTimes& core : previousCpu_) stats_.cpuIds.push_back(core.id);
         readSensors();   // everything except CPU load, which needs two samples
     }
 
@@ -1584,17 +1700,33 @@ public:
 
 private:
     // CPU load = how much of the time since the last sample each core spent working.
+    // Cores are matched by number, not position: one going offline and another
+    // coming back in the same interval keeps the count but shifts the rest.
     void updateCpuLoad() {
         std::vector<CpuTimes> now = readCpuTimes();
-        if (now.size() != previousCpu_.size()) {
-            stats_.cpuPercent.assign(now.size(), 0.0f);   // a core went on/offline; start over
-        } else {
-            for (size_t i = 0; i < now.size(); ++i) {
-                const double totalDelta  = static_cast<double>(now[i].total - previousCpu_[i].total);
-                const double activeDelta = static_cast<double>(now[i].active - previousCpu_[i].active);
-                if (totalDelta > 0.0) stats_.cpuPercent[i] = static_cast<float>(100.0 * activeDelta / totalDelta);
+        std::vector<float> percent(now.size(), 0.0f);   // 0 for a core that just came online
+        std::vector<int> ids(now.size());
+        // The counters only ever go up, except iowait, which the kernel may lower:
+        // each is compared on its own, and one that went down counts as no time.
+        const auto grown = [](unsigned long long current, unsigned long long before) {
+            return current > before ? static_cast<double>(current - before) : 0.0;
+        };
+        for (size_t i = 0; i < now.size(); ++i) {
+            ids[i] = now[i].id;
+            size_t before = i;   // usually the same position
+            if (before >= previousCpu_.size() || previousCpu_[before].id != now[i].id) {
+                before = std::find_if(previousCpu_.begin(), previousCpu_.end(), [&](const CpuTimes& core) { return core.id == now[i].id; }) -
+                         previousCpu_.begin();
+                if (before == previousCpu_.size()) continue;
             }
+            const CpuTimes& was = previousCpu_[before];
+            const double active = grown(now[i].active, was.active);
+            const double total = active + grown(now[i].idle, was.idle) + grown(now[i].iowait, was.iowait);
+            if (total > 0.0) percent[i] = static_cast<float>(std::clamp(100.0 * active / total, 0.0, 100.0));
+            else if (before < stats_.cpuPercent.size()) percent[i] = stats_.cpuPercent[before];   // no time passed: keep the last value
         }
+        stats_.cpuPercent = std::move(percent);
+        stats_.cpuIds = std::move(ids);
         previousCpu_ = std::move(now);
     }
 
@@ -1638,50 +1770,99 @@ std::string unescapeMountPath(std::string_view text) {
     return path;
 }
 
-// The disk ("nvme0n1") that a block device ("nvme0n1p2", "dm-0") is on.
-// A partition's sysfs folder sits inside its disk's folder; an encrypted or LVM
-// volume (dm-*) lists the devices it is built on under "slaves".
-std::string diskOfBlockDevice(const std::string& name, int depth = 0) {
+// The block device ("nvme0n1p2", "dm-0") with device number `device`, or "" if
+// there's none (filesystems that aren't on a disk get numbers of their own).
+std::string blockDeviceName(dev_t device) {
+    std::error_code error;
+    const fs::path path = fs::canonical(format("/sys/dev/block/%u:%u", major(device), minor(device)), error);
+    return error ? "" : path.filename().string();
+}
+
+// The disks ("nvme0n1") that a block device ("nvme0n1p2", "dm-0", "md0") is on.
+// A partition's sysfs folder sits inside its disk's folder; an encrypted, LVM
+// or RAID volume lists the devices it is built on under "slaves", which can be
+// on several disks (each of them then lists the volume's mount points).
+std::vector<std::string> disksOfBlockDevice(const std::string& name, int depth = 0) {
     const std::string dir = "/sys/class/block/" + name;
     if (fileExists(dir + "/partition")) {
         std::error_code error;
-        return fs::canonical(dir, error).parent_path().filename().string();
+        return {fs::canonical(dir, error).parent_path().filename().string()};
     }
-    const std::vector<fs::path> slaves = listDirectory(dir + "/slaves");
-    if (!slaves.empty() && depth < 4) return diskOfBlockDevice(slaves.front().filename().string(), depth + 1);
-    return name;
+    std::vector<std::string> disks;
+    if (depth < 4) {
+        for (const fs::path& slave : listDirectory(dir + "/slaves")) {
+            for (std::string& disk : disksOfBlockDevice(slave.filename().string(), depth + 1)) {
+                if (std::find(disks.begin(), disks.end(), disk) == disks.end()) disks.push_back(std::move(disk));
+            }
+        }
+    }
+    if (disks.empty()) disks.push_back(name);
+    return disks;
 }
 
-// Every storage device with how much of it is used and free.
+// The block device a mounted filesystem is really on, going by device numbers
+// rather than by the name in the mount table, which whoever mounted it chose
+// (a FUSE filesystem can call itself "/dev/nvme0n1p1"). "" if it isn't on one.
+std::string mountedBlockDevice(const std::string& source, const std::string& mountPoint, const std::string& type) {
+    struct stat mounted;
+    if (stat(mountPoint.c_str(), &mounted) != 0) return "";
+    struct stat device;
+    if (stat(source.c_str(), &device) != 0 || !S_ISBLK(device.st_mode)) {
+        return blockDeviceName(mounted.st_dev);   // "/dev/root" and the like: the mount's own number tells
+    }
+    if (mounted.st_dev == device.st_rdev) return blockDeviceName(device.st_rdev);
+    // btrfs gives every mount a number of its own, so there only the listed
+    // device can be gone by (mounting btrfs takes root anyway).
+    return type == "btrfs" ? blockDeviceName(device.st_rdev) : "";
+}
+
+// Every storage device with how much of it is used and free. Can wait a long
+// time on a filesystem that has stopped answering, so it's only ever called
+// on a helper thread (see StorageReader).
 std::vector<DiskUsage> readDiskUsage() {
     std::vector<DiskUsage> disks;
-    for (const DriveInfo& drive : readStorageDrives()) disks.push_back({drive});
+    for (const DriveInfo& drive : readStorageDrives()) {
+        DiskUsage usage;
+        usage.drive = drive;
+        disks.push_back(usage);
+    }
 
     // Each filesystem once, at its shortest mount point: btrfs mounts the same
     // partition several times (/, /home, /var/log, ...).
     std::map<std::string, std::string> mountPointOf;   // "sda2" -> "/"
     forEachLine("/proc/self/mounts", [&](const char* line) {
-        char source[512], mountPoint[1024];
-        if (sscanf(line, "%511s %1023s", source, mountPoint) != 2 || !startsWith(source, "/dev/")) return kKeepGoing;
-        std::error_code error;
-        const std::string device = fs::canonical(unescapeMountPath(source), error).filename().string();   // follows /dev/mapper/... links
+        // "source mount-point type options ...", separated by single spaces
+        // (spaces inside a field are written as \040).
+        std::string_view rest(line), fields[3];
+        for (std::string_view& field : fields) {
+            const size_t space = rest.find(' ');
+            field = rest.substr(0, space);
+            rest.remove_prefix(space == std::string_view::npos ? rest.size() : space + 1);
+        }
+        const std::string_view source = fields[0], type = fields[2];
+        // Only filesystems on a device; FUSE ones other than "fuseblk" (NTFS,
+        // exFAT) aren't, and one that has stopped answering would hold the read up.
+        if (!startsWith(source, "/dev/") || type == "fuse" || startsWith(type, "fuse.")) return kKeepGoing;
+        const std::string path = unescapeMountPath(fields[1]);
+        const std::string device = mountedBlockDevice(unescapeMountPath(source), path, std::string(type));
         if (device.empty()) return kKeepGoing;
-        const std::string path = unescapeMountPath(mountPoint);
         const auto [entry, added] = mountPointOf.emplace(device, path);
         if (!added && path.size() < entry->second.size()) entry->second = path;
         return kKeepGoing;
     });
 
     for (const auto& [device, mountPoint] : mountPointOf) {
-        const std::string diskName = diskOfBlockDevice(device);
-        const auto disk = std::find_if(disks.begin(), disks.end(),
-                                       [&](const DiskUsage& usage) { return usage.drive.deviceName == diskName; });
         struct statvfs space;
-        if (disk == disks.end() || statvfs(mountPoint.c_str(), &space) != 0) continue;
+        if (statvfs(mountPoint.c_str(), &space) != 0) continue;
         const double gbPerBlock = static_cast<double>(space.f_frsize) / kBytesPerGb;
-        disk->usedGb += static_cast<double>(space.f_blocks - space.f_bfree) * gbPerBlock;
-        disk->freeGb += static_cast<double>(space.f_bavail) * gbPerBlock;
-        disk->mountPoints.push_back(mountPoint);
+        for (const std::string& diskName : disksOfBlockDevice(device)) {
+            const auto disk = std::find_if(disks.begin(), disks.end(),
+                                           [&](const DiskUsage& usage) { return usage.drive.deviceName == diskName; });
+            if (disk == disks.end()) continue;
+            disk->usedGb += static_cast<double>(space.f_blocks - space.f_bfree) * gbPerBlock;
+            disk->freeGb += static_cast<double>(space.f_bavail) * gbPerBlock;
+            disk->mountPoints.push_back(mountPoint);
+        }
     }
     for (DiskUsage& disk : disks) std::sort(disk.mountPoints.begin(), disk.mountPoints.end());
     return disks;
@@ -1740,11 +1921,8 @@ bool operator!=(const Settings& a, const Settings& b) {
 }
 
 std::string settingsFilePath() {
-    const char* configHome = getenv("XDG_CONFIG_HOME");
-    const char* home = getenv("HOME");
-    if (configHome && *configHome) return std::string(configHome) + "/veeastats/settings.conf";
-    if (home && *home)             return std::string(home) + "/.config/veeastats/settings.conf";
-    return "";
+    const std::string configHome = xdgDirectory("XDG_CONFIG_HOME", ".config");
+    return configHome.empty() ? "" : configHome + "/veeastats/settings.conf";
 }
 
 // A missing or unreadable file simply gives the defaults, and so does an
@@ -1789,11 +1967,58 @@ void saveSettings(const Settings& settings) {
 }
 
 // The storage menu: its device list, and the device whose chart is showing.
+// Wakes the main loop to draw a frame (section 8).
+void wakeMainLoop();
+
+// Reads storage usage on a helper thread: statvfs on a filesystem that has
+// stopped answering (a USB drive pulled out mid-read, a stuck network mount)
+// can wait forever, and must never take the window with it. One read at a
+// time; while one is stuck, the last numbers stay up.
+class StorageReader {
+public:
+    // Starts a read, unless one is still going.
+    void request() {
+        std::lock_guard<std::mutex> lock(shared_->mutex);
+        if (shared_->reading) return;
+        shared_->reading = true;
+        std::thread([shared = shared_] {   // the shared state outlives the reader if a read never ends
+            std::vector<DiskUsage> disks = readDiskUsage();
+            {
+                std::lock_guard<std::mutex> lock(shared->mutex);
+                shared->result = std::move(disks);
+                shared->ready = true;
+                shared->reading = false;
+            }
+            wakeMainLoop();
+        }).detach();
+    }
+
+    // Moves the newest finished read into `disks`. False if there's none new.
+    bool take(std::vector<DiskUsage>& disks) {
+        std::lock_guard<std::mutex> lock(shared_->mutex);
+        if (!shared_->ready) return false;
+        disks = std::move(shared_->result);
+        shared_->ready = false;
+        return true;
+    }
+
+private:
+    struct Shared {
+        std::mutex mutex;
+        bool reading{false};
+        bool ready{false};
+        std::vector<DiskUsage> result;
+    };
+    std::shared_ptr<Shared> shared_ = std::make_shared<Shared>();
+};
+
 struct StorageMenu {
     bool open{false};
     std::string selected;            // deviceName of the chosen device ("" = none)
     std::vector<DiskUsage> disks;
-    double readAt{-1.0e9};           // ImGui time of the last readDiskUsage()
+    bool haveDisks{false};           // `disks` has been read at least once
+    StorageReader reader;
+    double readAt{-1.0e9};           // ImGui time the last read was asked for
 };
 
 // Everything the user can change from the window. main() reacts to changes after each frame.
@@ -1828,10 +2053,10 @@ const ImVec4& temperatureColor(double celsius) {
     return celsius >= kTooHotC ? kRed : celsius >= kHotC ? kOrange : kTemperatureColor;
 }
 
-// "62°C" or "144°F" from a reading in °C, or "N/A" without a sensor (0).
+// "62°C" or "144°F" from a reading in °C, or "N/A" without a sensor.
 std::string temperatureText(double celsius, bool fahrenheit) {
     constexpr const char* kDegree = "\xC2\xB0";   // "°" in UTF-8
-    if (celsius <= 0.0) return "N/A";
+    if (!hasTemperature(celsius)) return "N/A";
     return fahrenheit ? format("%.0f%sF", celsius * 9.0 / 5.0 + 32.0, kDegree) : format("%.0f%sC", celsius, kDegree);
 }
 
@@ -1867,7 +2092,7 @@ void drawSensorLine(double clockGhz, double volts, const char* voltageName, doub
     ImGui::TextDisabled("|");
     ImGui::SameLine();
 
-    if (celsius > 0.0) ImGui::TextColored(temperatureColor(celsius), "%s", temperatureText(celsius, fahrenheit).c_str());
+    if (hasTemperature(celsius)) ImGui::TextColored(temperatureColor(celsius), "%s", temperatureText(celsius, fahrenheit).c_str());
     else               ImGui::TextDisabled("Temp: N/A");
 }
 
@@ -1896,7 +2121,7 @@ void drawCpuSection(const StaticInfo& info, const LiveStats& live, bool fahrenhe
 
     ImGui::BeginChild("CpuCoresRegion", ImVec2(0, 200), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
     for (size_t i = 0; i < live.cpuPercent.size(); ++i) {
-        drawUsageBar(format("CPU %2zu", i).c_str(), live.cpuPercent[i], format("%.1f%%", live.cpuPercent[i]), 0.50f, 0.80f);
+        drawUsageBar(format("CPU %2d", i < live.cpuIds.size() ? live.cpuIds[i] : static_cast<int>(i)).c_str(), live.cpuPercent[i], format("%.1f%%", live.cpuPercent[i]), 0.50f, 0.80f);
     }
     ImGui::EndChild();
 }
@@ -2245,8 +2470,9 @@ void drawDiskChart(const DiskUsage& disk) {
 void drawStorageMenu(UiState& ui, const ImVec2& buttonMin, const ImVec2& buttonMax) {
     StorageMenu& menu = ui.storage;
     const double now = ImGui::GetTime();
+    if (menu.reader.take(menu.disks)) menu.haveDisks = true;
     if (now - menu.readAt > 2.0) {   // fresh numbers when it opens, then every couple of seconds
-        menu.disks = readDiskUsage();
+        menu.reader.request();
         menu.readAt = now;
     }
 
@@ -2256,7 +2482,8 @@ void drawStorageMenu(UiState& ui, const ImVec2& buttonMin, const ImVec2& buttonM
                                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
 
     ImGui::TextDisabled("Storage Devices");
-    if (menu.disks.empty()) ImGui::TextUnformatted("No storage devices found");
+    if (!menu.haveDisks) ImGui::TextUnformatted("Reading...");
+    else if (menu.disks.empty()) ImGui::TextUnformatted("No storage devices found");
     const DiskUsage* chosen = nullptr;
     if (!menu.disks.empty() && ImGui::BeginTable("##Devices", 2, ImGuiTableFlags_SizingFixedFit)) {
         for (const DiskUsage& disk : menu.disks) {
@@ -2283,7 +2510,7 @@ void drawStorageMenu(UiState& ui, const ImVec2& buttonMin, const ImVec2& buttonM
                                   !ImGui::IsMouseHoveringRect(buttonMin, buttonMax, false);
     if (clickedElsewhere || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         menu.open = false;
-        menu.readAt = -1.0e9;   // read again next time it opens
+        menu.readAt = -1.0e9;   // read again next time it opens (the last numbers show meanwhile)
     }
     ImGui::End();
 }
@@ -2410,6 +2637,8 @@ struct HudState {
     // live values instead of jumping.
     float cpu{0.0f}, ram{0.0f}, gpu{0.0f}, vram{0.0f};
     std::vector<float> cores;
+    std::vector<int> coreIds;   // each core's number, for its label (see LiveStats::cpuIds)
+    int coreId(int index) const { return static_cast<size_t>(index) < coreIds.size() ? coreIds[static_cast<size_t>(index)] : index; }
 };
 
 // While animating, displayed numbers move a share of the remaining distance
@@ -2429,6 +2658,7 @@ void glideHudValues(HudState& state, const LiveStats& live) {
     glide(state.vram, live.gpu.hasMemory ? live.gpu.vramUsage : 0.0f, state.animate);
     state.cores.resize(live.cpuPercent.size(), 0.0f);
     for (size_t i = 0; i < live.cpuPercent.size(); ++i) glide(state.cores[i], live.cpuPercent[i], state.animate);
+    state.coreIds = live.cpuIds;
 }
 
 // What each of the four gauges shows.
@@ -2443,7 +2673,7 @@ struct GaugeReading {
 // "4.86 GHz · 62°C": the clock, and the temperature when there is a sensor.
 std::string clockAndTemperature(double clockGhz, double celsius, bool fahrenheit) {
     const std::string clock = clockGhz > 0.0 ? format("%.2f GHz", clockGhz) : "CLOCK N/A";
-    return celsius > 0.0 ? clock + " \xC2\xB7 " + temperatureText(celsius, fahrenheit) : clock;
+    return hasTemperature(celsius) ? clock + " \xC2\xB7 " + temperatureText(celsius, fahrenheit) : clock;
 }
 
 std::array<GaugeReading, 4> gaugeReadings(const HudState& state, const LiveStats& live) {
@@ -2915,7 +3145,7 @@ void drawJarvCores(ImDrawList* draw, const Box& box, const HudState& jarv) {
     for (int i = 0; i < count; ++i) {
         const float left = start.x + columnWidth * static_cast<float>(i / rows);   // cores run down each column
         const float midY = std::floor(start.y + kRowHeight * (static_cast<float>(i % rows) + 0.5f));
-        const std::string name = format("C%02d", i);
+        const std::string name = format("C%02d", jarv.coreId(i));
         const ImVec2 nameExtent = textSize(jarv.displayFont, 10.0f, name);
         panel->AddText(jarv.displayFont, 10.0f, ImVec2(left, midY - nameExtent.y * 0.5f), withAlpha(kJarvMuted, 1.0f), name.c_str());
 
@@ -3557,7 +3787,7 @@ void drawGunshipCores(ImDrawList* draw, const Box& box, const HudState& state) {
             panel->AddRectFilled(ImVec2(b.x, doorY), ImVec2(b.x + kGap, doorY + 8.0f), withAlpha(kFgCyan, 1.0f));
         }
 
-        drawOutlinedText(panel, state.displayFont, 8.0f, a + ImVec2(6.0f, 6.0f), kFgWhite, format("C%02d", i));
+        drawOutlinedText(panel, state.displayFont, 8.0f, a + ImVec2(6.0f, 6.0f), kFgWhite, format("C%02d", state.coreId(i)));
         const std::string text = format("%.0f%%", value);
         const ImVec2 extent = textSize(state.textFont, 16.0f, text);
         drawOutlinedText(panel, state.textFont, 16.0f, ImVec2(b.x - extent.x - 6.0f, b.y - extent.y - 4.0f), kFgWhite, text);
@@ -3959,7 +4189,7 @@ void drawHalloweenCores(ImDrawList* draw, const Box& box, const HudState& state)
         }
         panel->AddLine(ImVec2(a.x + 6.0f, a.y + 2.0f), ImVec2(b.x - 6.0f, a.y + 2.0f), withAlpha(kHwStoneLit, 0.7f), 1.0f);
 
-        drawHalloweenText(panel, state.textFont, 12.0f, a + ImVec2(6.0f, 3.0f), kHwMist, format("C%02d", i), 1.0f);
+        drawHalloweenText(panel, state.textFont, 12.0f, a + ImVec2(6.0f, 3.0f), kHwMist, format("C%02d", state.coreId(i)), 1.0f);
         const std::string text = format("%.0f%%", value);
         const ImVec2 extent = textSize(state.displayFont, 19.0f, text);
         drawHalloweenText(panel, state.displayFont, 19.0f, ImVec2(b.x - extent.x - 5.0f, b.y - extent.y + 1.0f), kHwBone, text, 1.5f);
@@ -4715,7 +4945,7 @@ void drawOtakuCores(ImDrawList* draw, const Box& box, const HudState& state) {
 
         const Box chip{ImVec2(x, midY - 7.0f), ImVec2(x + 30.0f, midY + 7.0f)};
         panel->AddRectFilled(chip.min, chip.max, withAlpha(kOtViolet, 0.9f), 7.0f);
-        drawCenteredText(panel, state.textFont, 11.0f, ImVec2((chip.min.x + chip.max.x) * 0.5f, midY), withAlpha(kOtWhite, 1.0f), format("C%02d", i));
+        drawCenteredText(panel, state.textFont, 11.0f, ImVec2((chip.min.x + chip.max.x) * 0.5f, midY), withAlpha(kOtWhite, 1.0f), format("C%02d", state.coreId(i)));
         const float barRight = x + columnWidth - 40.0f;
         drawPillBar(panel, Box{ImVec2(chip.max.x + 6.0f, midY - 4.0f), ImVec2(barRight, midY + 5.0f)}, value, otakuLoadColor(value, 0.50f, 0.80f));
         const std::string text = format("%.0f%%", value);
@@ -5009,7 +5239,7 @@ void drawCyberpunkCores(ImDrawList* draw, const Box& box, const HudState& state)
         const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
         const float x = std::floor(start.x + static_cast<float>(i / rows) * (columnWidth + kColumnGap));
         const float midY = std::floor(start.y + (static_cast<float>(i % rows) + 0.5f) * kRowHeight);
-        const std::string label = format("C%02d", i);
+        const std::string label = format("C%02d", state.coreId(i));
         const ImVec2 labelExtent = textSize(state.displayFont, 9.0f, label);
         panel->AddText(state.displayFont, 9.0f, ImVec2(x, midY - labelExtent.y * 0.5f), withAlpha(kCpRed, 1.0f), label.c_str());
         const ImVec4& color = cyberpunkLoadColor(value, 0.50f, 0.80f);
@@ -5294,7 +5524,7 @@ void drawGnomeCores(ImDrawList* draw, const Box& box, const HudState& state) {
         const float value = std::clamp(state.cores[static_cast<size_t>(i)], 0.0f, 100.0f);
         const float x = std::floor(start.x + static_cast<float>(i / rows) * (columnWidth + kColumnGap));
         const float midY = std::floor(start.y + (static_cast<float>(i % rows) + 0.5f) * kRowHeight);
-        const std::string label = format("CPU %d", i);
+        const std::string label = format("CPU %d", state.coreId(i));
         const ImVec2 labelExtent = textSize(state.textFont, 13.0f, label);
         panel->AddText(state.textFont, 13.0f, ImVec2(x, midY - labelExtent.y * 0.5f), withAlpha(g_gnome.dim, 1.0f), label.c_str());
         drawGnomeBar(panel, Box{ImVec2(x + 50.0f, midY - 3.0f), ImVec2(x + columnWidth - 40.0f, midY + 3.0f)}, value, gnomeLoadColor(value, 0.50f, 0.80f));
@@ -5552,19 +5782,29 @@ bool loadSymbol(void* library, const char* name, Function& function) {
 
 // ---- Requests from other threads --------------------------------------------
 
-// Other threads (the hotkey portal, a second launch of the program) ask the main
-// loop to do things by setting these bits and waking it up.
+// Other threads ask the main loop to do things by setting these bits and waking
+// it up: the overlay's report reader (its hotkey, on screen or not, ended), the
+// hotkey portal, the desktop-appearance watcher, the listener for a second
+// launch of the program, and the threads reading the hardware details and the
+// storage usage.
 constexpr unsigned kRequestShowWindow     = 1u << 0;
 constexpr unsigned kRequestQuit           = 1u << 1;
 constexpr unsigned kRequestToggleOverlay  = 1u << 2;
-constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it appeared or disappeared; see g_overlayActive
+constexpr unsigned kRequestOverlayChanged = 1u << 3;   // it appeared or disappeared; see g_overlayActivePid
 constexpr unsigned kRequestStaticInfo     = 1u << 4;   // the hardware details are ready (see main)
 constexpr unsigned kRequestAppearance     = 1u << 5;   // the desktop's light/dark style or accent colour changed
+constexpr unsigned kRequestOverlayEnded   = 1u << 6;   // the overlay process stopped (crashed, or lost its display)
+constexpr unsigned kRequestRedraw         = 1u << 7;   // something on screen changed (storage numbers arrived)
 std::atomic<unsigned> g_requests{0};
 
-// True while the overlay is on screen (not while it waits, hidden, for its app
-// to be focused again). The main loop only reads stats while someone can see them.
-std::atomic<bool> g_overlayActive{false};
+// The overlay process that is on screen right now (not one waiting, hidden, for
+// its app to be focused again), or -1. The main loop only reads stats while
+// someone can see them. A pid rather than a flag, so a report from an overlay
+// that has since been replaced can't change it.
+std::atomic<pid_t> g_overlayActivePid{-1};
+
+// The overlay process whose reports just ended (it quit or crashed), or -1.
+std::atomic<pid_t> g_overlayEndedPid{-1};
 
 // The helper threads run until the process ends, so a request can arrive while
 // main() is shutting GLFW down. GLFW may only be woken while it is running.
@@ -5577,6 +5817,8 @@ void postRequest(unsigned request) {
     if (g_glfwRunning) glfwPostEmptyEvent();   // wakes the main loop if it is sleeping
 }
 
+void wakeMainLoop() { postRequest(kRequestRedraw); }
+
 // ---- The overlay process ------------------------------------------------------
 
 // The libX11 functions the overlay uses.
@@ -5586,6 +5828,9 @@ struct X11Api {
     decltype(&XDefaultRootWindow) defaultRootWindow{};
     decltype(&XKeysymToKeycode) keysymToKeycode{};
     decltype(&XGrabKey) grabKey{};
+    decltype(&XUngrabKey) ungrabKey{};
+    decltype(&XRefreshKeyboardMapping) refreshKeyboardMapping{};
+    decltype(&XkbSetDetectableAutoRepeat) setDetectableAutoRepeat{};
     decltype(&XSync) sync{};
     decltype(&XNextEvent) nextEvent{};
     decltype(&XSetErrorHandler) setErrorHandler{};
@@ -5602,6 +5847,8 @@ struct X11Api {
         return library && loadSymbol(library, "XInitThreads", initThreads) && loadSymbol(library, "XOpenDisplay", openDisplay) &&
                loadSymbol(library, "XDefaultRootWindow", defaultRootWindow) &&
                loadSymbol(library, "XKeysymToKeycode", keysymToKeycode) && loadSymbol(library, "XGrabKey", grabKey) &&
+               loadSymbol(library, "XUngrabKey", ungrabKey) && loadSymbol(library, "XRefreshKeyboardMapping", refreshKeyboardMapping) &&
+               loadSymbol(library, "XkbSetDetectableAutoRepeat", setDetectableAutoRepeat) &&
                loadSymbol(library, "XSync", sync) && loadSymbol(library, "XNextEvent", nextEvent) &&
                loadSymbol(library, "XSetErrorHandler", setErrorHandler) && loadSymbol(library, "XInternAtom", internAtom) &&
                loadSymbol(library, "XGetWindowProperty", getWindowProperty) && loadSymbol(library, "XFree", free) &&
@@ -5621,10 +5868,10 @@ int ignoreX11Error(Display*, XErrorEvent*) {
 // The numbers the overlay shows, sent over by the main process as one line:
 // "stats <cpu %> <cpu V> <cpu °C> <ram %> <ram used GB> <ram total GB> <gpu has load> <gpu %> <gpu V> <gpu °C> <in °F>".
 struct OverlayNumbers {
-    float cpuPercent{0.0f}, cpuVolts{0.0f}, cpuCelsius{0.0f};
+    float cpuPercent{0.0f}, cpuVolts{0.0f}, cpuCelsius{std::numeric_limits<float>::quiet_NaN()};   // NaN: no sensor (sent as "nan")
     float ramPercent{0.0f}, ramUsedGb{0.0f}, ramTotalGb{0.0f};
     int gpuHasLoad{0};
-    float gpuPercent{0.0f}, gpuVolts{0.0f}, gpuCelsius{0.0f};
+    float gpuPercent{0.0f}, gpuVolts{0.0f}, gpuCelsius{std::numeric_limits<float>::quiet_NaN()};
     int fahrenheit{0};
 };
 
@@ -5645,29 +5892,66 @@ bool parseOverlayStatsLine(const std::string& line, OverlayNumbers& numbers) {
     return true;
 }
 
-// Watches for Ctrl+Shift+O on its own X11 connection (X11 connections can't be
-// shared between threads) and tells the main process "hotkey" on every press.
+// Watches for Ctrl+Shift+O on an X11 connection of its own (it waits in
+// XNextEvent, which would hold up the drawing thread's calls on a shared one)
+// and tells the main process "hotkey" on every press.
 // Runs for the life of the overlay process.
 void watchX11Hotkey(const X11Api* x11) {
     Display* display = x11->openDisplay(nullptr);
     if (!display) return;
     const Window root = x11->defaultRootWindow(display);
-    const KeyCode key = x11->keysymToKeycode(display, XK_o);
-    // A grab only matches the exact modifiers, so ask again with Caps Lock and Num Lock on.
-    for (const unsigned locks : {0u, unsigned(LockMask), unsigned(Mod2Mask), unsigned(LockMask | Mod2Mask)}) {
-        x11->grabKey(display, key, ControlMask | ShiftMask | locks, root, False, GrabModeAsync, GrabModeAsync);
-    }
-    x11->sync(display, False);
+    constexpr unsigned kHotkeyModifiers = ControlMask | ShiftMask;
 
-    // Holding the keys down repeats the press; only the first one counts.
-    constexpr Time kRepeatGapMs = 500;
+    // Holding the keys down makes X repeat the press. With "detectable
+    // auto-repeat" the repeats come without a key release in between, so a
+    // press counts only once the key has really been let go. (Without it, each
+    // repeat comes as a release + press, and only the time between them tells.)
+    Bool detectableRepeat = False;
+    x11->setDetectableAutoRepeat(display, True, &detectableRepeat);
+
+    // Grabs Ctrl+Shift+O, or moves the grab when the keyboard layout changes.
+    // A grab only matches the exact modifiers, so it's made again with Caps Lock
+    // and Num Lock on.
+    KeyCode grabbed = 0;
+    const auto grabHotkey = [&] {
+        constexpr unsigned kLocks[] = {0u, unsigned(LockMask), unsigned(Mod2Mask), unsigned(LockMask | Mod2Mask)};
+        if (grabbed != 0) {
+            for (const unsigned locks : kLocks) x11->ungrabKey(display, grabbed, kHotkeyModifiers | locks, root);
+        }
+        // Keycode 0 (no "o" anywhere in the layout, as in a Cyrillic-only one)
+        // means "any key" to XGrabKey: that would take every Ctrl+Shift shortcut
+        // from every program. No hotkey is better.
+        grabbed = x11->keysymToKeycode(display, XK_o);
+        if (grabbed != 0) {
+            for (const unsigned locks : kLocks) {
+                x11->grabKey(display, grabbed, kHotkeyModifiers | locks, root, False, GrabModeAsync, GrabModeAsync);
+            }
+        }
+        x11->sync(display, False);
+    };
+    grabHotkey();
+
+    constexpr Time kRepeatGapMs = 500;   // only used without detectable auto-repeat
+    bool released = true;
     Time lastPress = 0;
     XEvent event;
     while (true) {
         x11->nextEvent(display, &event);
-        if (event.type != KeyPress) continue;
-        const bool repeat = lastPress != 0 && event.xkey.time - lastPress < kRepeatGapMs;
+        if (event.type == MappingNotify) {   // the keyboard layout changed: "o" may be another key now
+            x11->refreshKeyboardMapping(&event.xmapping);
+            if (event.xmapping.request == MappingKeyboard) grabHotkey();
+            continue;
+        }
+        // While the grab is active, every key comes here: only O itself counts.
+        if ((event.type != KeyPress && event.type != KeyRelease) || event.xkey.keycode != grabbed) continue;
+        if (event.type == KeyRelease) {
+            released = true;
+            continue;
+        }
+        const bool repeat = !released || (!detectableRepeat && lastPress != 0 && event.xkey.time - lastPress < kRepeatGapMs);
+        released = false;
         lastPress = event.xkey.time;
+        if ((event.xkey.state & kHotkeyModifiers) != kHotkeyModifiers) continue;   // Ctrl or Shift was let go first
         if (!repeat && write(STDOUT_FILENO, "hotkey\n", 7) < 0) return;
     }
 }
@@ -5687,7 +5971,9 @@ Window focusedX11Window(const X11Api& x11, Display* display, Window overlayWindo
     unsigned char* data = nullptr;
     if (x11.getWindowProperty(display, x11.defaultRootWindow(display), activeWindowAtom, 0, 1, False, XA_WINDOW, &type,
                               &format, &count, &remaining, &data) == Success && data) {
-        if (count == 1) active = *reinterpret_cast<Window*>(data);
+        // Any X client can set this property, in any shape: only a single
+        // 32-bit window id is read (anything else would be read past its end).
+        if (type == XA_WINDOW && format == 32 && count == 1) active = *reinterpret_cast<Window*>(data);
         x11.free(data);
     }
 
@@ -5717,7 +6003,10 @@ std::optional<ImVec2> windowCorner(const X11Api& x11, Display* display, Window w
 // desktops give one area covering all screens in _NET_WORKAREA. (GLFW's
 // glfwGetMonitorWorkarea also needs _NET_CURRENT_DESKTOP, which GNOME doesn't set.)
 ImVec2 screenCorner(const X11Api& x11, Display* display) {
+    // No monitor at all for a moment (the only screen went to sleep, a KVM
+    // switch): GLFW has nothing to ask, and would crash if asked anyway.
     GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    if (!monitor) return ImVec2(0.0f, 0.0f);
     int monitorX = 0, monitorY = 0;
     glfwGetMonitorPos(monitor, &monitorX, &monitorY);
     const GLFWvidmode* mode = glfwGetVideoMode(monitor);
@@ -5728,8 +6017,10 @@ ImVec2 screenCorner(const X11Api& x11, Display* display) {
         int format;
         unsigned long count, remaining;
         unsigned char* data = nullptr;
-        if (x11.getWindowProperty(display, x11.defaultRootWindow(display), x11.internAtom(display, property, False), 0, 64,
-                                  False, AnyPropertyType, &type, &format, &count, &remaining, &data) != Success || !data) {
+        const Atom atom = x11.internAtom(display, property, True);   // True: look up only, don't create it
+        if (atom == None ||
+            x11.getWindowProperty(display, x11.defaultRootWindow(display), atom, 0, 64, False, AnyPropertyType, &type, &format,
+                                  &count, &remaining, &data) != Success || !data) {
             continue;
         }
         // Rectangles as (x, y, width, height); use the first that overlaps the main screen.
@@ -5762,7 +6053,7 @@ struct OverlayRow {
 
 // "62°C  1.212 V": the temperature and voltage, whichever are known, or "N/A".
 std::string overlaySensorText(float celsius, float volts, bool fahrenheit) {
-    std::string text = celsius > 0.0f ? temperatureText(celsius, fahrenheit) : "";
+    std::string text = hasTemperature(celsius) ? temperatureText(celsius, fahrenheit) : "";
     if (volts > 0.0f) text += (text.empty() ? "" : "  ") + format("%.3f V", volts);
     return text.empty() ? "N/A" : text;
 }
@@ -6323,7 +6614,7 @@ int runOverlayProcess() {
     const UiFonts fonts = loadFonts();
 
     std::thread(watchX11Hotkey, &x11).detach();
-    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
+    setNonBlocking(STDIN_FILENO);
 
     OverlayNumbers numbers;
     Skin skin = Skin::Jarv;
@@ -6486,13 +6777,12 @@ public:
     OverlayProcess& operator=(const OverlayProcess&) = delete;
     ~OverlayProcess() { stop(); }
 
-    bool active() const { return g_overlayActive; }
+    bool active() const { return pid_ > 0 && g_overlayActivePid == pid_; }
 
     // Starts `CpuMonitor --overlay`, if there is an X11 display (XWayland
     // counts) to show it on.
     void start() {
-        const char* x11Display = getenv("DISPLAY");
-        if (!x11Display || !*x11Display) return;
+        if (!x11DisplayAvailable()) return;
 
         int toOverlay[2], fromOverlay[2];
         if (pipe2(toOverlay, O_CLOEXEC) != 0) return;
@@ -6517,9 +6807,42 @@ public:
             return;
         }
         fd_ = toOverlay[1];
-        fcntl(fd_, F_SETFL, O_NONBLOCK);   // a stuck overlay must never freeze the main window
-        std::thread(readReports, fromOverlay[0]).detach();
+        setNonBlocking(fd_);   // a stuck overlay must never freeze the main window
+        std::thread(readReports, fromOverlay[0], pid_).detach();
+        if (!skinLine_.empty()) send(skinLine_);   // a restarted overlay keeps the skin
     }
+
+    // Starts a new overlay if the old one has ended on its own (it crashed, or
+    // lost its X display), since on X11 it also carries the hotkey. At most 3
+    // restarts a minute, so one that can't start doesn't spin; past that, the
+    // restart waits (see secondsUntilRetry). Returns true if it started one.
+    bool restartIfEnded() {
+        if (!x11DisplayAvailable()) return false;
+        // Its reports end a moment before the process itself has, so a report
+        // that it ended counts even if waitpid doesn't know yet.
+        const pid_t endedPid = g_overlayEndedPid.exchange(-1);
+        const bool ended = pid_ > 0 && endedPid == pid_;
+        if (fd_ >= 0 && pid_ > 0 && !ended) {
+            if (waitpid(pid_, nullptr, WNOHANG) == 0) return false;   // still running
+            pid_ = -1;   // reaped just now: its pid may be reused, so never signal it
+        }
+        stop();   // reaps it, if that's still to do
+        retryAt_ = -1.0;
+        const double now = glfwGetTime();
+        double& oldest = restartTimes_[nextRestart_];
+        if (oldest >= 0.0 && now - oldest < 60.0) {
+            retryAt_ = oldest + 60.0;
+            return false;
+        }
+        oldest = now;
+        nextRestart_ = (nextRestart_ + 1) % restartTimes_.size();
+        start();
+        return fd_ >= 0;
+    }
+
+    // How long until a restart held back by the limit is due (the main loop
+    // wakes up for it), or -1 if none is waiting.
+    double secondsUntilRetry() const { return retryAt_ < 0.0 ? -1.0 : std::max(retryAt_ - glfwGetTime(), 0.0); }
 
     // The hotkey was pressed. `stats` is sent first so the overlay never opens
     // with old numbers. `limitToApp` is the "Limit Overlay to Focused App" setting.
@@ -6531,6 +6854,7 @@ public:
         if (now - lastToggle_ < kTogglePause) return;
         lastToggle_ = now;
 
+        restartIfEnded();   // the press still opens it, if it had gone
         sendStats(stats, fahrenheit);
         send(limitToApp ? "toggle app\n" : "toggle screen\n");
     }
@@ -6538,12 +6862,20 @@ public:
     void sendStats(const LiveStats& stats, bool fahrenheit) { send(overlayStatsLine(stats, fahrenheit)); }
 
     // The overlay draws itself in the same skin as the main window.
-    void setSkin(Skin skin) { send(std::string("skin ") + skinChoice(skin).id + "\n"); }
+    void setSkin(Skin skin) {
+        skinLine_ = std::string("skin ") + skinChoice(skin).id + "\n";
+        send(skinLine_);
+    }
 
 private:
+    static bool x11DisplayAvailable() {
+        const char* display = getenv("DISPLAY");
+        return display && *display;
+    }
+
     // Passes the overlay's reports on to the main loop: "hotkey" (from its X11
-    // key grab) and "active 1/0". Ends when the overlay process does.
-    static void readReports(int fd) {
+    // key grab) and "active 1/0". Ends when the overlay process (`pid`) does.
+    static void readReports(int fd, pid_t pid) {
         std::string line;
         char c;
         while (read(fd, &c, 1) == 1) {
@@ -6553,29 +6885,38 @@ private:
             }
             if (line == "hotkey") {
                 postRequest(kRequestToggleOverlay);
-            } else if (line == "active 1" || line == "active 0") {
-                g_overlayActive = (line == "active 1");
+            } else if (line == "active 1") {
+                g_overlayActivePid = pid;
+                postRequest(kRequestOverlayChanged);
+            } else if (line == "active 0") {
+                pid_t expected = pid;   // only if it's still this overlay that counts as on screen
+                g_overlayActivePid.compare_exchange_strong(expected, -1);
                 postRequest(kRequestOverlayChanged);
             }
             line.clear();
         }
-        g_overlayActive = false;
+        pid_t expected = pid;
+        g_overlayActivePid.compare_exchange_strong(expected, -1);
         close(fd);
+        g_overlayEndedPid = pid;
+        postRequest(kRequestOverlayEnded);   // the main loop starts a new one (see restartIfEnded)
     }
 
-    // Sends one line. If the overlay has gone away, it simply stays gone.
+    // Sends one line. If the overlay has gone away, it's restarted by
+    // restartIfEnded, not here.
     void send(const std::string& line) {
         if (fd_ >= 0 && write(fd_, line.data(), line.size()) < 0 && errno != EAGAIN) stop();
     }
 
+    // Ends the overlay. Closing its pipe would end it too, but only at its next
+    // look at the pipe, so it's signalled straight away (see endChildProcess).
     void stop() {
         if (fd_ >= 0) {
-            close(fd_);   // the overlay sees the pipe close and quits
+            close(fd_);
             fd_ = -1;
         }
         if (pid_ > 0) {
-            kill(pid_, SIGTERM);
-            waitpid(pid_, nullptr, 0);
+            endChildProcess(pid_, false);
             pid_ = -1;
         }
     }
@@ -6583,11 +6924,20 @@ private:
     pid_t pid_{-1};
     int fd_{-1};
     double lastToggle_{-1.0};
+    std::string skinLine_;                                     // the last "skin ..." line sent
+    std::array<double, 3> restartTimes_{-1.0, -1.0, -1.0};      // when the last 3 restarts happened
+    size_t nextRestart_{0};
+    double retryAt_{-1.0};                                     // when a held-back restart is due, or -1
 };
 
 // ---- Hotkey through the desktop's GlobalShortcuts portal ----------------------
 
 // The GLib functions used to talk to the portal over D-Bus.
+// G_VARIANT_TYPE() would call into GLib, which isn't linked (it's loaded at
+// runtime, see GioApi); a GVariantType is just its type string, so a cast does
+// the same.
+const GVariantType* variantType(const char* typeString) { return reinterpret_cast<const GVariantType*>(typeString); }
+
 struct GioApi {
     decltype(&g_bus_get_sync) busGetSync{};
     decltype(&g_dbus_connection_get_unique_name) uniqueName{};
@@ -6600,6 +6950,7 @@ struct GioApi {
     decltype(&g_variant_lookup_value) lookupValue{};
     decltype(&g_variant_n_children) childCount{};
     decltype(&g_variant_get_type_string) typeString{};
+    decltype(&g_variant_is_object_path) isObjectPath{};
     decltype(&g_variant_unref) unref{};
     decltype(&g_main_context_new) newContext{};
     decltype(&g_main_context_push_thread_default) pushContext{};
@@ -6617,7 +6968,8 @@ struct GioApi {
                loadSymbol(library, "g_dbus_connection_signal_unsubscribe", signalUnsubscribe) &&
                loadSymbol(library, "g_variant_new_parsed", newParsed) && loadSymbol(library, "g_variant_get", get) &&
                loadSymbol(library, "g_variant_lookup", lookup) && loadSymbol(library, "g_variant_lookup_value", lookupValue) &&
-               loadSymbol(library, "g_variant_n_children", childCount) && loadSymbol(library, "g_variant_get_type_string", typeString) && loadSymbol(library, "g_variant_unref", unref) &&
+               loadSymbol(library, "g_variant_n_children", childCount) && loadSymbol(library, "g_variant_get_type_string", typeString) &&
+               loadSymbol(library, "g_variant_is_object_path", isObjectPath) && loadSymbol(library, "g_variant_unref", unref) &&
                loadSymbol(library, "g_main_context_new", newContext) &&
                loadSymbol(library, "g_main_context_push_thread_default", pushContext) &&
                loadSymbol(library, "g_main_loop_new", newLoop) && loadSymbol(library, "g_main_loop_run", runLoop) &&
@@ -6655,8 +7007,8 @@ void registerWithPortal(const GioApi& gio, GDBusConnection* bus) {
 class ShortcutsPortal {
 public:
     // Registers Ctrl+Shift+O with the desktop, then posts kRequestToggleOverlay
-    // every time it is pressed. Never returns unless the portal is unavailable,
-    // so it runs on a thread of its own.
+    // every time it is pressed. Runs for as long as VeeaStats does (so on a
+    // thread of its own), unless there's no portal or the shortcut isn't bound.
     void run() {
         if (!gio_.load()) return;
         GMainContext* context = gio_.newContext();
@@ -6679,9 +7031,18 @@ public:
         GVariant* results = request("CreateSession", gio_.newParsed("({'handle_token': <%s>, 'session_handle_token': <%s>},)",
                                                                     token.c_str(), "veeastats"), token);
         if (!results) return;   // no GlobalShortcuts portal on this desktop
-        const char* sessionHandle = nullptr;
-        gio_.lookup(results, "session_handle", "&s", &sessionHandle);
-        session_ = sessionHandle ? sessionHandle : "";
+        // Everything the portal sends is checked before use: the session handle
+        // goes into "%o" arguments below, and GLib aborts the whole program on a
+        // string there that isn't a valid object path.
+        if (GVariant* handle = gio_.lookupValue(results, "session_handle", nullptr)) {
+            const std::string type = gio_.typeString(handle);
+            if (type == "s" || type == "o") {
+                const char* text = nullptr;
+                gio_.get(handle, type == "s" ? "&s" : "&o", &text);
+                if (text && gio_.isObjectPath(text)) session_ = text;
+            }
+            gio_.unref(handle);
+        }
         gio_.unref(results);
         if (session_.empty()) return;
 
@@ -6697,6 +7058,7 @@ public:
                 const gchar* shortcut = nullptr;
                 guint64 timestamp = 0;
                 GVariant* options = nullptr;
+                if (strcmp(portal.gio_.typeString(parameters), "(osta{sv})") != 0) return;   // not a signal we understand
                 portal.gio_.get(parameters, "(&o&st@a{sv})", &session, &shortcut, &timestamp, &options);
                 if (session == portal.session_ && strcmp(shortcut, "toggle-overlay") == 0) postRequest(kRequestToggleOverlay);
                 portal.gio_.unref(options);
@@ -6719,13 +7081,15 @@ private:
     // Portal methods answer later, through a "Response" signal on a Request
     // object named after `token`. Calls `method` and waits for that answer.
     // Returns its results (unref them when done), or nullptr if the call failed
-    // or the user said no.
-    GVariant* request(const char* method, GVariant* parameters, const std::string& token) {
+    // or the user said no. `cancelled` is set only when the user said no
+    // (response 1), not when the desktop or the call failed (2).
+    GVariant* request(const char* method, GVariant* parameters, const std::string& token, bool* cancelled = nullptr) {
         struct Answer {
             GioApi* gio;
             GMainLoop* loop;
             guint32 code{2};
             GVariant* results{nullptr};
+            bool answered{false};   // only the first Response counts (a second one would leak the first's results)
         } answer{&gio_, loop_};
 
         const std::string path = std::string(kPortalPath) + "/request/" + sender_ + "/" + token;
@@ -6733,7 +7097,11 @@ private:
             bus_, kPortalBusName, "org.freedesktop.portal.Request", "Response", path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
             [](GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*, GVariant* parameters, gpointer data) {
                 Answer& answer = *static_cast<Answer*>(data);
-                answer.gio->get(parameters, "(u@a{sv})", &answer.code, &answer.results);
+                if (answer.answered) return;
+                answer.answered = true;
+                if (strcmp(answer.gio->typeString(parameters), "(ua{sv})") == 0) {
+                    answer.gio->get(parameters, "(u@a{sv})", &answer.code, &answer.results);
+                }
                 answer.gio->quitLoop(answer.loop);
             },
             &answer, nullptr);
@@ -6744,6 +7112,7 @@ private:
         }
         gio_.signalUnsubscribe(bus_, subscription);
 
+        if (cancelled) *cancelled = (answer.code == 1);
         if (answer.code != 0 && answer.results) {
             gio_.unref(answer.results);
             answer.results = nullptr;
@@ -6756,7 +7125,9 @@ private:
         const std::string token = nextToken();
         GVariant* results = request("ListShortcuts", gio_.newParsed("(%o, {'handle_token': <%s>})", session.c_str(), token.c_str()), token);
         if (!results) return false;
-        GVariant* shortcuts = gio_.lookupValue(results, "shortcuts", nullptr);
+        // With the expected type given, a value of any other type comes back as
+        // nullptr (counting the children of a non-container would abort).
+        GVariant* shortcuts = gio_.lookupValue(results, "shortcuts", variantType("a(sa{sv})"));
         const bool bound = shortcuts && gio_.childCount(shortcuts) > 0;
         if (shortcuts) gio_.unref(shortcuts);
         gio_.unref(results);
@@ -6770,13 +7141,15 @@ private:
         if (declinedMarker.empty() || fileExists(declinedMarker)) return false;
 
         const std::string token = nextToken();
+        bool cancelled = false;
         GVariant* results = request(
             "BindShortcuts",
             gio_.newParsed("(%o, [('toggle-overlay', {'description': <'Show or hide the VeeaStats overlay'>, "
                            "'preferred_trigger': <'CTRL+SHIFT+o'>})], '', {'handle_token': <%s>})",
                            session.c_str(), token.c_str()),
-            token);
-        if (!results) {
+            token, &cancelled);
+        if (!results && !cancelled) return false;   // the desktop failed, not the user: try again next launch
+        if (!results) {   // the user said no: don't ask at every launch
             std::error_code ignored;
             fs::create_directories(fs::path(declinedMarker).parent_path(), ignored);
             if (FILE* file = fopen(declinedMarker.c_str(), "w")) fclose(file);
@@ -6840,17 +7213,22 @@ private:
         return reply;
     }
 
-    // The value of an org.freedesktop.appearance setting (unref it when done), or nullptr.
+    // The value of an org.freedesktop.appearance setting (unref it when done), or
+    // nullptr. Each reply's type is checked first: unpacking a reply of another
+    // shape would leave the pointers empty.
     GVariant* read(const char* key) {
+        const auto isVariantReply = [&](GVariant* reply) { return strcmp(gio_.typeString(reply), "(v)") == 0; };
         GVariant* value = nullptr;
         if (GVariant* reply = call("ReadOne", key)) {
-            gio_.get(reply, "(v)", &value);
+            if (isVariantReply(reply)) gio_.get(reply, "(v)", &value);
             gio_.unref(reply);
         } else if (GVariant* oldReply = call("Read", key)) {   // older portals: the value is wrapped twice
-            GVariant* wrapped = nullptr;
-            gio_.get(oldReply, "(v)", &wrapped);
-            if (strcmp(gio_.typeString(wrapped), "v") == 0) gio_.get(wrapped, "v", &value);
-            gio_.unref(wrapped);
+            if (isVariantReply(oldReply)) {
+                GVariant* wrapped = nullptr;
+                gio_.get(oldReply, "(v)", &wrapped);
+                if (strcmp(gio_.typeString(wrapped), "v") == 0) gio_.get(wrapped, "v", &value);
+                gio_.unref(wrapped);
+            }
             gio_.unref(oldReply);
         }
         return value;
@@ -6885,6 +7263,7 @@ private:
                 const gchar* settingsNamespace = nullptr;
                 const gchar* key = nullptr;
                 GVariant* value = nullptr;
+                if (strcmp(watcher.gio_.typeString(parameters), "(ssv)") != 0) return;   // not a signal we understand
                 watcher.gio_.get(parameters, "(&s&sv)", &settingsNamespace, &key, &value);
                 watcher.store(key, value);
                 watcher.gio_.unref(value);
@@ -6906,7 +7285,9 @@ private:
 // user opened a newer AppImage, the old copy quits and the new one takes over.
 // The copies talk through a Unix socket with an abstract name (no file on disk).
 
-const std::string kBuildId = __DATE__ " " __TIME__;
+// A plain constant, not a std::string: the listener thread can still be
+// answering while the program exits, after strings have been destroyed.
+constexpr const char kShowThisBuild[] = "show " __DATE__ " " __TIME__;
 
 sockaddr_un instanceSocketAddress(socklen_t& length) {
     sockaddr_un address{};
@@ -6942,16 +7323,22 @@ bool peerIsThisUser(int fd) {
     return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &length) == 0 && peer.uid == getuid();
 }
 
-// Sends `message` to the running copy and returns its reply ("" if none is running).
+// Sends `message` to the running copy and returns its reply ("" if none is
+// running, or if it doesn't answer within a few seconds).
 std::string messageRunningCopy(const std::string& message) {
     socklen_t length;
     const sockaddr_un address = instanceSocketAddress(length);
     const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return "";
+    // A copy that is stopped (Ctrl+Z, a frozen cgroup) never accepts, and once
+    // its queue is full connect() would wait forever; this limits that wait.
+    const timeval connectLimit{2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &connectLimit, sizeof(connectLimit));
     std::string reply;
     if (connect(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0 && peerIsThisUser(fd)) {
         const std::string line = message + "\n";
-        if (write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size())) reply = readSocketLine(fd, 2000);
+        // MSG_NOSIGNAL: a copy that quits just now must not kill this one with SIGPIPE.
+        if (send(fd, line.data(), line.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(line.size())) reply = readSocketLine(fd, 2000);
     }
     close(fd);
     return reply;
@@ -6963,13 +7350,14 @@ std::string messageRunningCopy(const std::string& message) {
 int claimOnlyCopy(bool& handedOver) {
     socklen_t length;
     const sockaddr_un address = instanceSocketAddress(length);
-    for (int attempt = 0; attempt < 30; ++attempt) {
+    const double deadline = monotonicMs() + 6000.0;   // a copy that never answers can't hold up the launch for long
+    for (int attempt = 0; attempt < 30 && monotonicMs() < deadline; ++attempt) {
         const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (fd < 0) return -1;
         if (bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0 && listen(fd, 4) == 0) return fd;
         close(fd);
 
-        if (messageRunningCopy("show " + kBuildId) == "ok") {
+        if (messageRunningCopy(kShowThisBuild) == "ok") {
             handedOver = true;
             return -1;
         }
@@ -6978,13 +7366,18 @@ int claimOnlyCopy(bool& handedOver) {
     return -1;   // couldn't sort it out: run anyway
 }
 
-// Answers other copies: "show <build>" and "quit". Runs on a thread of its own.
+// Answers other copies: "show <build>" and "quit". Runs on a thread of its own
+// until main() shuts the socket down on the way out.
 void listenForOtherCopies(int listenFd) {
     while (true) {
         const int client = accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) {
-            if (errno == EINTR) continue;
-            return;
+            if (errno == EINVAL || errno == EBADF || errno == ENOTSOCK) return;   // shut down: VeeaStats is quitting
+            // Anything else (EINTR, out of file descriptors or memory, a client
+            // that gave up) passes: stopping here would leave the name taken
+            // with nobody answering, and every launch would wait on it.
+            if (errno != EINTR) usleep(100 * 1000);
+            continue;
         }
         if (!peerIsThisUser(client)) {
             close(client);
@@ -6992,7 +7385,7 @@ void listenForOtherCopies(int listenFd) {
         }
         const std::string message = readSocketLine(client, 1000);
         std::string reply;
-        if (message == "show " + kBuildId) {
+        if (message == kShowThisBuild) {
             reply = "ok\n";
             postRequest(kRequestShowWindow);
         } else if (startsWith(message, "show ")) {   // a different build: make way for it
@@ -7002,7 +7395,7 @@ void listenForOtherCopies(int listenFd) {
             reply = "ok\n";
             postRequest(kRequestQuit);
         }
-        if (!reply.empty() && write(client, reply.data(), reply.size()) < 0) {
+        if (!reply.empty() && send(client, reply.data(), reply.size(), MSG_NOSIGNAL) < 0) {
             // the other copy gave up waiting; nothing to do
         }
         close(client);
@@ -7023,13 +7416,21 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    signal(SIGPIPE, SIG_IGN);   // writing to an overlay that has quit must not end the program
+
+    // Graphics first: a different build that's already running quits to make
+    // way for this one (see claimOnlyCopy), so this copy must know it can run
+    // (a display to show its window on, for one) before it asks for that.
+    glfwSetErrorCallback(onGlfwError);
+    if (!glfwInit()) return 1;
+
     bool handedOver = false;
     const int instanceSocket = claimOnlyCopy(handedOver);
     if (handedOver) return 0;   // VeeaStats was already running and is showing its window instead
-    signal(SIGPIPE, SIG_IGN);   // writing to an overlay that has quit must not end the program
-
-    glfwSetErrorCallback(onGlfwError);
-    if (!glfwInit()) return 1;
+    // Answer other copies straight away, not once startup has finished: a launch
+    // meanwhile would otherwise wait, give up and run as a second copy. Their
+    // requests are only stored until the main loop starts.
+    if (instanceSocket >= 0) std::thread(listenForOtherCopies, instanceSocket).detach();
 
 #if defined(IMGUI_IMPL_OPENGL_ES3)
     const char* glslVersion = "#version 300 es";
@@ -7113,7 +7514,6 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(g_glfwLock);
         g_glfwRunning = true;   // from here on the helper threads may wake the main loop
     }
-    if (instanceSocket >= 0) std::thread(listenForOtherCopies, instanceSocket).detach();
     // On X11 sessions the overlay's own key grab already works in every program.
     if (getenv("WAYLAND_DISPLAY")) std::thread(runShortcutsPortal).detach();
     OverlayProcess overlay;
@@ -7128,6 +7528,7 @@ int main(int argc, char** argv) {
             staticInfo = staticInfoReady.get();
             framesToDraw = 2;
         }
+        if (requests & kRequestRedraw) framesToDraw = 2;
         if (requests & kRequestAppearance) {      // the desktop switched between light and dark, or changed accent
             setGnomeAppearance(g_desktopDark, rgbColor(g_desktopAccent));
             if (ui.settings.skin == Skin::Gnome) applySkin(ui.settings.skin, fonts);
@@ -7140,9 +7541,14 @@ int main(int argc, char** argv) {
             windowHidden = false;
             framesToDraw = 2;
         }
+        if ((requests & kRequestOverlayEnded) || overlay.secondsUntilRetry() == 0.0) overlay.restartIfEnded();
         if (requests & kRequestToggleOverlay) {
-            monitorLive.refresh();                // fresh numbers in case it's opening
-            lastRefresh = glfwGetTime();
+            // Fresh numbers in case it's opening, unless they're fresh already:
+            // CPU load measured over a few milliseconds is just 0% or 100%.
+            if (glfwGetTime() - lastRefresh >= 0.25) {
+                monitorLive.refresh();
+                lastRefresh = glfwGetTime();
+            }
             overlay.toggle(monitorLive.stats(), ui.settings.limitOverlayToApp, ui.settings.fahrenheit);
         }
 
@@ -7221,6 +7627,9 @@ int main(int argc, char** argv) {
         } else if (overlay.active()) {
             timeout = untilRefresh;
         }
+        if (const double retry = overlay.secondsUntilRetry(); retry >= 0.0) {   // an overlay restart is waiting
+            timeout = (timeout < 0.0) ? retry : std::min(timeout, retry);
+        }
 
         // Sleep until the timeout, but wake straight away for user input or a
         // request from another thread. Any other wake-up just goes back to sleep
@@ -7235,7 +7644,7 @@ int main(int argc, char** argv) {
         else               glfwWaitEventsTimeout(timeout);
         while (keepSleeping()) {
             if (timeout < 0.0) glfwWaitEvents();
-            else               glfwWaitEventsTimeout(deadline - glfwGetTime());
+            else               glfwWaitEventsTimeout(std::max(deadline - glfwGetTime(), 0.0));   // never negative: GLFW rejects that
         }
         if (inputArrived) framesToDraw = 2;
     }
@@ -7244,6 +7653,10 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(g_glfwLock);
         g_glfwRunning = false;   // no more wake-ups from the helper threads
     }
+    // Stop answering other copies: one opened from now on gets "nobody here"
+    // instead of an "ok" from a window that's about to close, and the listener
+    // thread ends. (Not closed: the thread may still be using the descriptor.)
+    if (instanceSocket >= 0) shutdown(instanceSocket, SHUT_RDWR);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

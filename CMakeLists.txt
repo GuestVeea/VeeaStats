@@ -69,6 +69,18 @@ target_link_libraries(CpuMonitor PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
+# Hardening, set here rather than left to each distro's compiler defaults (Ubuntu
+# turns most of these on by itself, other distros don't): stack canaries,
+# checked string/memory functions, a position-independent program, and a
+# read-only symbol table resolved at startup.
+include(CheckPIESupported)
+check_pie_supported()
+set_target_properties(CpuMonitor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(CpuMonitor PRIVATE -fstack-protector-strong $<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2>)
+target_link_options(CpuMonitor PRIVATE -Wl,-z,relro -Wl,-z,now)
+# Warnings for VeeaStats' own code (not for Dear ImGui's files).
+set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
+
 # Bundle libstdc++/libgcc into the binary so it doesn't depend on the build
 # machine's (possibly newer) C++ runtime. That matters for the release AppImage,
 # which packaging/build-appimage.sh checks; a build for your own PC works either
